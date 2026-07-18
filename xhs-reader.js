@@ -164,11 +164,12 @@ const CORS_PROXIES = [
 async function fetchXhsHtml(xhsUrl) {
   // 注意：CF Worker 不适合抓 HTML 页面（它带了图片专用 Accept 头，会被小红书拒绝）
   // CF Worker 只用于下载图片。HTML 抓取只用公共代理。
+  // allorigins 放首位——名字就是"all origins"，对浏览器 Origin 头最宽容
   const proxies = [
+    { name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
     { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
     { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
-    { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
-    { name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` }
+    { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` }
   ];
 
   let lastErr = null;
@@ -180,7 +181,11 @@ async function fetchXhsHtml(xhsUrl) {
       log(`fetchXhsHtml: [${proxyName}] 尝试: ${proxyUrl.substring(0, 80)}...`, 'info');
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
-      const resp = await fetch(proxyUrl, { signal: controller.signal });
+      const resp = await fetch(proxyUrl, {
+        signal: controller.signal,
+        mode: 'cors',            // 显式 CORS 模式，避免浏览器自动降级
+        credentials: 'omit'     // 不发 cookie，减少代理拒绝概率
+      });
       clearTimeout(timeout);
       if (!resp.ok) {
         const err = `HTTP ${resp.status}`;
@@ -281,10 +286,10 @@ async function downloadImageAsDataUrl(imageUrl) {
   if (cfWorker) {
     proxies.push({ name: 'CF-Worker', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
   }
-  // 按用户要求：allorigins 和 corsproxy 总是失败，放到最后
+  // CF Worker 优先，allorigins 其次（对浏览器 Origin 头最宽容）
+  proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
   proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
   proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
-  proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
   proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
 
   const errors = [];
@@ -295,7 +300,11 @@ async function downloadImageAsDataUrl(imageUrl) {
       log(`  [${proxyName}] 尝试下载`, 'info');
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 20000);
-      const resp = await fetch(proxyUrl, { signal: controller.signal });
+      const resp = await fetch(proxyUrl, {
+        signal: controller.signal,
+        mode: 'cors',
+        credentials: 'omit'
+      });
       clearTimeout(timeout);
       if (!resp.ok) {
         const err = `HTTP ${resp.status}`;
