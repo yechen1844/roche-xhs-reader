@@ -1585,8 +1585,12 @@ async function renderConversationList() {
     el.innerHTML = conversations.map(c => {
       const id = c.id || c.conversationId;
       const name = c.name || c.title || c.handle || id;
+      const avatar = c.avatar || '';
       const selected = runtime.selectedIds.includes(id);
-      return `<div class="xhs-conv-item ${selected ? 'selected' : ''}" data-id="${id}">${name}</div>`;
+      const avatarHtml = avatar
+        ? `<img src="${avatar}" style="width:32px;height:32px;border-radius:50%;object-fit:cover;flex:0 0 auto;" onerror="this.style.display='none'" />`
+        : `<div style="width:32px;height:32px;border-radius:50%;background:#e5e7eb;flex:0 0 auto;"></div>`;
+      return `<div class="xhs-conv-item ${selected ? 'selected' : ''}" data-id="${id}" style="display:flex;align-items:center;gap:10px;">${avatarHtml}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${name}</span></div>`;
     }).join('');
   } catch (e) {
     el.innerHTML = `<div style="color:#e74c3c;font-size:12px;">加载失败: ${e.message}</div>`;
