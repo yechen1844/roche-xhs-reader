@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.3.1",
-  "description": "小红书链接注入器 v2.3.1：监听改用官方 API roche.memory.getShortTerm() 替代直接操作 IndexedDB（解决自动监听总是失败的根因），增加详细调试日志，injectTextMessage 删原消息失败时容错。",
+  "version": "2.4.0",
+  "description": "小红书链接注入器 v2.4.0：1)隐藏悬浮球 2)每次启动插件都不自动监听，必须用户手动开启 3)代理顺序调整：codetabs优先（allorigins和corsproxy总是失败） 4)取消自动删除功能 5)轮询间隔从300ms改为2s，只读最新3条消息，避免Roche reactive系统变卡 6)模式二注入后多事件派发刷新UI",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",
