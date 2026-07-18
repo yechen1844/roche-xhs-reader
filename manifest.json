@@ -1,0 +1,15 @@
+{
+  "id": "xhs-reader",
+  "name": "小红书链接注入器",
+  "version": "2.1.0",
+  "description": "小红书链接注入器 v2.1：模式一直注原文+图片（10条自动删可开关），模式二下载图片→发给副API vision模型总结为300字→丢弃图片（只注入总结+评论+卡片占位符）。退出按钮保留，插件App关闭后监听继续运行。",
+  "author": "Roche Plugin",
+  "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
+  "hash": "",
+  "permissions": [
+    "character:read",
+    "memory:read",
+    "storage",
+    "ui"
+  ]
+}

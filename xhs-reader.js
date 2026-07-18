@@ -1,0 +1,1544 @@
+/**
+ * Roche 小红书链接注入器 v2.1.0
+ *
+ * 模式一（直注模式）：原文 + 独立图片消息，10 条自动删（可开关）
+ * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
+ *                            注入：总结文本 + 评论 + 卡片占位符
+ *
+ * 触发方式：监听消息库，用户回车后 300ms 内立即替换
+ * 重要：插件 App 关闭后监听继续运行（unmount 不停止定时器）
+ */
+
+window.RochePlugin.register({
+  id: "xhs-reader",
+  name: "小红书链接注入器",
+  version: "2.1.0",
+  apps: [
+    {
+      id: "xhs-reader-home",
+      name: "小红书注入器",
+      icon: "extension",
+      iconImage: "",
+      async mount(container, roche) {
+        const root = document.createElement('div');
+        root.className = 'roche-plugin-xhs-reader';
+        container.appendChild(root);
+        await initApp(root, roche);
+      },
+      async unmount(container, roche) {
+        // 关键：不停止监听！让插件 App 关闭后继续在后台运行
+        // 只清理 UI 引用，保留定时器
+        if (runtime.rootEl) {
+          runtime.rootEl = null;
+        }
+        container.replaceChildren();
+      }
+    }
+  ]
+});
+
+// ============================================================
+// 状态
+// ============================================================
+let runtime = {
+  initialized: false,
+  roche: null,
+  rootEl: null,
+  mode: 1,                     // 1 = 直注模式, 2 = 总结模式
+  autoListen: false,
+  pollTimer: null,
+  pollInterval: 300,           // 300ms 快速检测
+  selectedIds: [],
+  processedLinks: {},          // {key: {ts, convId, textMsgId, imageMsgIds, msgCountAtInject}}
+  deleteAfterCount: 10,        // 10 条后自动删
+  deleteTextEnabled: true,
+  deleteImagesEnabled: true,
+  cleanupTimer: null,
+  cleanupInterval: 5000,       // 5 秒检查一次
+  apiPresets: [],              // [{id, name, baseUrl, apiKey, model, temperature}]
+  activePresetId: null,
+  userPersona: null,           // 缓存用户人设
+  logs: []
+};
+
+const STORE_KEYS = {
+  mode: 'xhs_mode',
+  autoListen: 'xhs_auto_listen',
+  selectedIds: 'xhs_selected_ids',
+  processedLinks: 'xhs_processed_links',
+  deleteAfterCount: 'xhs_delete_after_count',
+  deleteTextEnabled: 'xhs_delete_text_enabled',
+  deleteImagesEnabled: 'xhs_delete_images_enabled',
+  apiPresets: 'xhs_api_presets',
+  activePresetId: 'xhs_active_preset_id',
+  cfWorker: 'xhs_cf_worker'
+};
+
+let rocheStorage = null;
+
+// ============================================================
+// IndexedDB 操作（Roche 主消息库）
+// ============================================================
+const DB_NAME = 'Roche_db';
+let _db = null;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    if (_db) { resolve(_db); return; }
+    const req = indexedDB.open(DB_NAME);
+    req.onsuccess = () => { _db = req.result; resolve(_db); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function getAllRecords(storeName) {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const req = db.transaction(storeName, 'readonly').objectStore(storeName).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function getMessagesByConversation(conversationId) {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction('messages', 'readonly');
+    const store = tx.objectStore('messages');
+    const index = store.index('conversationId');
+    const req = index.getAll(conversationId);
+    req.onsuccess = () => {
+      req.result.sort((a, b) => a.timestamp - b.timestamp);
+      resolve(req.result);
+    };
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function addMessage(msg) {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const req = db.transaction('messages', 'readwrite').objectStore('messages').add(msg);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function deleteMessage(id) {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const req = db.transaction('messages', 'readwrite').objectStore('messages').delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+// ============================================================
+// 日志
+// ============================================================
+function log(msg, type = 'info') {
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  runtime.logs.push({ time: t, msg, type });
+  if (runtime.logs.length > 200) runtime.logs.shift();
+  if (runtime.rootEl) {
+    const el = runtime.rootEl.querySelector('#xhs-logs');
+    if (el) renderLogs();
+  }
+}
+
+// ============================================================
+// 小红书抓取（不变）
+// ============================================================
+const CORS_PROXIES = [
+  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  (url) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`,
+  (url) => `https://thingproxy.freeboard.io/fetch/${url}`
+];
+
+async function fetchXhsHtml(xhsUrl) {
+  let lastErr = null;
+  for (let i = 0; i < CORS_PROXIES.length; i++) {
+    const proxyUrl = CORS_PROXIES[i](xhsUrl);
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      const resp = await fetch(proxyUrl, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (!resp.ok) { lastErr = new Error(`HTTP ${resp.status}`); continue; }
+      const html = await resp.text();
+      if (html && html.includes('__INITIAL_STATE__')) return html;
+      lastErr = new Error('页面未包含 __INITIAL_STATE__');
+    } catch (e) { lastErr = e; continue; }
+  }
+  throw new Error(`所有代理均失败: ${lastErr?.message || '未知错误'}`);
+}
+
+function parseXhsState(html) {
+  const m = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]+?\})\s*<\/script>/);
+  if (!m) throw new Error('未找到 __INITIAL_STATE__');
+  const jsonStr = m[1].replace(/undefined/g, 'null');
+  return JSON.parse(jsonStr);
+}
+
+function extractNote(state) {
+  let note = state?.noteData?.data?.noteData;
+  if (!note && state?.note?.noteDetailMap) {
+    const map = state.note.noteDetailMap;
+    const firstKey = Object.keys(map)[0];
+    note = firstKey ? map[firstKey]?.note : null;
+  }
+  return note;
+}
+
+function extractComments(state) {
+  let cd = state?.noteData?.data?.commentData;
+  if (!cd && state?.note?.noteDetailMap) {
+    const map = state.note.noteDetailMap;
+    const firstKey = Object.keys(map)[0];
+    cd = firstKey ? map[firstKey]?.comments : null;
+  }
+  return cd;
+}
+
+const MAX_IMAGES = 9;
+
+function normalizeImgUrl(url) {
+  if (!url) return '';
+  if (url.startsWith('//')) return 'https:' + url;
+  if (!url.startsWith('http')) return '';
+  return url;
+}
+
+function extractNoteImages(note) {
+  const imgs = [];
+  if (note.type === 'video') {
+    const cover = note.video?.imageUrl || note.video?.coverImage?.url || '';
+    const url = normalizeImgUrl(cover);
+    if (url) imgs.push({ url, alt: '视频封面' });
+  }
+  if (note.imageList?.length) {
+    for (const item of note.imageList.slice(0, MAX_IMAGES)) {
+      const url = normalizeImgUrl(item.url || item.urlDefault || '');
+      if (url) imgs.push({ url, alt: '笔记配图' });
+    }
+  }
+  return imgs;
+}
+
+function extractTags(note) {
+  const tags = [];
+  if (note.tagList?.length) {
+    for (const t of note.tagList) {
+      const name = typeof t === 'string' ? t : (t.name || t.id || '');
+      if (name) tags.push(name);
+    }
+  }
+  return tags;
+}
+
+function extractPreview(note, maxLen = 100) {
+  const desc = note.desc || '';
+  if (desc.length <= maxLen) return desc;
+  return desc.substring(0, maxLen) + '...';
+}
+
+async function downloadImageAsDataUrl(imageUrl) {
+  const cfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
+  const proxies = [];
+  if (cfWorker) {
+    proxies.push((u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u));
+  }
+  proxies.push((u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`);
+  proxies.push((u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`);
+  proxies.push((u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}`);
+
+  const errors = [];
+  for (let i = 0; i < proxies.length; i++) {
+    const proxyName = (cfWorker && i === 0) ? 'CF-Worker' : `代理${i + 1}`;
+    const proxyUrl = proxies[i](imageUrl);
+    try {
+      log(`  [${proxyName}] 尝试下载`, 'info');
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 20000);
+      const resp = await fetch(proxyUrl, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (!resp.ok) {
+        const err = `HTTP ${resp.status}`;
+        log(`  [${proxyName}] ${err}`, 'error');
+        errors.push(`${proxyName}: ${err}`);
+        continue;
+      }
+      const blob = await resp.blob();
+      if (blob.size === 0) {
+        const err = 'blob 大小为 0';
+        log(`  [${proxyName}] ${err}`, 'error');
+        errors.push(`${proxyName}: ${err}`);
+        continue;
+      }
+      const ct = blob.type || 'image/jpeg';
+      log(`  [${proxyName}] OK, ${blob.size} 字节, 类型: ${ct}`, 'success');
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+      log(`  [${proxyName}] base64 长度: ${dataUrl.length}`, 'success');
+      return dataUrl;
+    } catch (e) {
+      log(`  [${proxyName}] 异常: ${e.message}`, 'error');
+      errors.push(`${proxyName}: ${e.message}`);
+    }
+  }
+  throw new Error(`所有代理失败: ${errors.join(' | ')}`);
+}
+
+async function processXhsLinkFull(xhsUrl) {
+  const html = await fetchXhsHtml(xhsUrl);
+  const state = parseXhsState(html);
+  const note = extractNote(state);
+  if (!note) throw new Error('未找到笔记数据');
+  const comments = extractComments(state);
+  const images = extractNoteImages(note);
+  const tags = extractTags(note);
+  const preview = extractPreview(note);
+  return { note, comments, images, tags, preview };
+}
+
+// ============================================================
+// 用户人设（获取分享者名字）
+// ============================================================
+async function getSharerName() {
+  if (runtime.userPersona) return runtime.userPersona;
+  try {
+    if (runtime.roche?.persona?.getActiveUserPersona) {
+      const p = await runtime.roche.persona.getActiveUserPersona();
+      runtime.userPersona = p?.handle || p?.name || '我';
+      return runtime.userPersona;
+    }
+  } catch (e) {}
+  return '我';
+}
+
+// ============================================================
+// 消息注入辅助
+// ============================================================
+function genMsgId() {
+  return `msg_${Date.now()}${Math.random().toString().slice(1)}`;
+}
+
+async function injectTextMessage(originalMsg, text) {
+  const newMsg = {
+    id: genMsgId(),
+    text,
+    isMe: originalMsg.isMe,
+    type: 'text',
+    timestamp: (originalMsg.timestamp || Date.now()) + 1,
+    conversationId: originalMsg.conversationId
+  };
+  if (originalMsg.senderId !== undefined) newMsg.senderId = originalMsg.senderId;
+  if (originalMsg.senderName !== undefined) newMsg.senderName = originalMsg.senderName;
+  await deleteMessage(originalMsg.id);
+  await addMessage(newMsg);
+  return newMsg;
+}
+
+async function injectImageMessage(originalMsg, imageDataUrl, offset) {
+  const imgMsg = {
+    id: genMsgId(),
+    text: '[Image Upload]',
+    isMe: originalMsg.isMe,
+    content: imageDataUrl,
+    type: 'image',
+    timestamp: (originalMsg.timestamp || Date.now()) + 2 + (offset || 0),
+    conversationId: originalMsg.conversationId,
+    isVisionRecognized: false
+  };
+  if (originalMsg.senderId !== undefined) imgMsg.senderId = originalMsg.senderId;
+  if (originalMsg.senderName !== undefined) imgMsg.senderName = originalMsg.senderName;
+  await addMessage(imgMsg);
+  return imgMsg;
+}
+
+// ============================================================
+// 模式一：直注模式
+// ============================================================
+function formatNoteMode1(note, comments, sharerName) {
+  const lines = [];
+  lines.push(`${sharerName}分享了一个小红书笔记：`);
+  lines.push('');
+  lines.push(`# ${note.title || '(无标题)'}`);
+  lines.push('');
+  lines.push(note.desc || '(无正文)');
+  lines.push('');
+  const tags = extractTags(note);
+  if (tags.length > 0) {
+    lines.push(`标签：${tags.join(' ')}`);
+    lines.push('');
+  }
+  if (comments?.comments?.length) {
+    lines.push('热门评论：');
+    for (const c of comments.comments.slice(0, 10)) {
+      const u = c.user?.nickName || c.user?.nickname || '匿名';
+      const t = (c.content || '').trim();
+      let line = `- ${u}：${t}`;
+      if (c.likeCount > 0) line += ` (${c.likeCount}赞)`;
+      lines.push(line);
+      if (c.subComments?.length) {
+        for (const sc of c.subComments.slice(0, 2)) {
+          const su = sc.user?.nickName || sc.user?.nickname || '匿名';
+          lines.push(`  ↳ ${su}：${sc.content || ''}`);
+        }
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+async function processMode1(msg, xhsUrl, result) {
+  const { note, comments, images } = result;
+  const sharerName = await getSharerName();
+  const text = formatNoteMode1(note, comments, sharerName);
+  const newTextMsg = await injectTextMessage(msg, text);
+  const imageMsgIds = [];
+  let imgOk = 0, imgFail = 0;
+  for (let i = 0; i < images.length; i++) {
+    try {
+      log(`下载图片 ${i + 1}/${images.length}`, 'info');
+      const dataUrl = await downloadImageAsDataUrl(images[i].url);
+      const imgMsg = await injectImageMessage(newTextMsg, dataUrl, i);
+      imageMsgIds.push(imgMsg.id);
+      imgOk++;
+    } catch (e) {
+      imgFail++;
+      log(`图片 ${i + 1} 失败: ${e.message}`, 'error');
+    }
+  }
+  return { textMsgId: newTextMsg.id, imageMsgIds, imgOk, imgFail };
+}
+
+// ============================================================
+// 模式二：总结模式
+// ============================================================
+function formatCommentsText(comments) {
+  if (!comments?.comments?.length) return '(无评论)';
+  const lines = [];
+  for (const c of comments.comments.slice(0, 10)) {
+    const u = c.user?.nickName || c.user?.nickname || '匿名';
+    const t = (c.content || '').trim();
+    let line = `- ${u}：${t}`;
+    if (c.likeCount > 0) line += ` (${c.likeCount}赞)`;
+    lines.push(line);
+    if (c.subComments?.length) {
+      for (const sc of c.subComments.slice(0, 2)) {
+        const su = sc.user?.nickName || sc.user?.nickname || '匿名';
+        lines.push(`  ↳ ${su}：${sc.content || ''}`);
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+function getActivePreset() {
+  return runtime.apiPresets.find(p => p.id === runtime.activePresetId);
+}
+
+async function callSubApi(systemPrompt, userPrompt, imageUrls) {
+  const preset = getActivePreset();
+  if (!preset) throw new Error('未选择副 API 预设');
+  if (!preset.baseUrl || !preset.apiKey || !preset.model) {
+    throw new Error('预设配置不完整');
+  }
+  let url = preset.baseUrl.replace(/\/$/, '');
+  if (!url.endsWith('/v1/chat/completions')) {
+    if (url.endsWith('/v1')) url += '/chat/completions';
+    else if (url.endsWith('/chat/completions')) {} // 已是完整 URL
+    else url += '/v1/chat/completions';
+  }
+  log(`调用副 API: ${url} 模型: ${preset.model} 图片: ${imageUrls?.length || 0}张`, 'info');
+
+  // 构造 messages：如果有图片就发多模态格式
+  const userContent = [];
+  if (imageUrls && imageUrls.length > 0) {
+    for (const img of imageUrls) {
+      userContent.push({ type: 'image_url', image_url: { url: img } });
+    }
+  }
+  userContent.push({ type: 'text', text: userPrompt });
+
+  const body = {
+    model: preset.model,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent }
+    ],
+    temperature: preset.temperature ?? 0.5,
+    max_tokens: 1000
+  };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);  // vision 请求给 60 秒
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${preset.apiKey}`
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${errText.substring(0, 200)}`);
+    }
+    const data = await resp.json();
+    const text = data.choices?.[0]?.message?.content || '';
+    if (!text) throw new Error('副 API 返回空内容');
+    return text.trim();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function summarizeNote(note, comments, imageDataUrls) {
+  const desc = note.desc || '';
+  const title = note.title || '(无标题)';
+  const commentsText = formatCommentsText(comments);
+  const tags = extractTags(note).join('、');
+
+  // 系统提示：允许保留值得记录的原文
+  const systemPrompt = `你是一个小红书笔记总结助手。请基于提供的笔记正文、图片和评论，生成一份 300 字左右的中文总结。
+
+要求：
+1. 保留关键信息（地点、价格、步骤、推荐、产品名、地点名等）
+2. 允许把值得记录的原文句子（如具体价格、关键步骤、金句）原样放入总结
+3. 图片里的信息也要纳入总结
+4. 不要添加评论或主观评价
+5. 控制在 300 字左右，不要超过 400 字`;
+
+  const userPrompt = `标题：${title}
+标签：${tags}
+
+正文：
+${desc}
+
+评论：
+${commentsText}
+
+请总结这篇笔记（包括图片中的信息）。`;
+
+  // 如果有图片，必须调用副 API 让 vision 模型看图
+  if (imageDataUrls && imageDataUrls.length > 0) {
+    log(`准备发送 ${imageDataUrls.length} 张图片给副 API 总结`, 'info');
+    const summary = await callSubApi(systemPrompt, userPrompt, imageDataUrls);
+    log(`副 API 总结完成（含图片识别），长度 ${summary.length}`, 'success');
+    return summary;
+  }
+
+  // 没图片：≤300 字原样，>300 字调 API 总结
+  if (desc.length <= 300) {
+    log(`无图片且正文 ${desc.length} 字 ≤300，原样输出`, 'info');
+    return desc;
+  }
+  log(`无图片且正文 ${desc.length} 字 >300，调用副 API 总结`, 'info');
+  const summary = await callSubApi(systemPrompt, userPrompt, null);
+  log(`副 API 总结完成，长度 ${summary.length}`, 'success');
+  return summary;
+}
+
+function formatNoteMode2(note, comments, summary, sharerName) {
+  const title = note.title || '';
+  const tags = extractTags(note);
+  const images = extractNoteImages(note);
+  const preview = extractPreview(note, 120);
+  const commentsText = formatCommentsText(comments);
+  const imageUrls = images.map(i => i.url).join(',');
+
+  // char 看到的部分 + 卡片占位符
+  const lines = [];
+  lines.push(`${sharerName}分享了一个小红书笔记：`);
+  lines.push('');
+  lines.push(`# ${title || '(无标题)'}`);
+  lines.push('');
+  lines.push('[笔记总结]');
+  lines.push(summary);
+  lines.push('[/笔记总结]');
+  lines.push('');
+  lines.push('[用户评论]');
+  lines.push(commentsText);
+  lines.push('[/用户评论]');
+  lines.push('');
+  // 卡片占位符（user 通过正则渲染成卡片，char 看到的是一串标记，但很短）
+  lines.push('[XHS_CARD]');
+  lines.push(`title=${title}`);
+  lines.push(`images=${imageUrls}`);
+  lines.push(`preview=${preview}`);
+  lines.push(`tags=${tags.join(',')}`);
+  lines.push('[/XHS_CARD]');
+
+  return lines.join('\n');
+}
+
+async function processMode2(msg, xhsUrl, result) {
+  const { note, comments, images } = result;
+  const sharerName = await getSharerName();
+
+  // 下载所有图片为 base64 data URL（仅用于发送给副 API，不注入消息库）
+  // 总结完成后这些数据会随函数返回自然丢弃
+  const imageDataUrls = [];
+  for (let i = 0; i < images.length; i++) {
+    try {
+      log(`模式二: 下载图片 ${i + 1}/${images.length} (临时, 总结后丢弃)`, 'info');
+      const dataUrl = await downloadImageAsDataUrl(images[i].url);
+      imageDataUrls.push(dataUrl);
+    } catch (e) {
+      log(`模式二: 图片 ${i + 1} 下载失败: ${e.message}`, 'error');
+    }
+  }
+
+  // 调用副 API 总结（带上图片让 vision 模型看图）
+  const summary = await summarizeNote(note, comments, imageDataUrls);
+
+  // 总结完成，图片数据不再需要（不注入消息库，随作用域自然释放）
+  log(`模式二: 总结完成, 已丢弃 ${imageDataUrls.length} 张图片数据`, 'info');
+
+  const text = formatNoteMode2(note, comments, summary, sharerName);
+  const newTextMsg = await injectTextMessage(msg, text);
+  return {
+    textMsgId: newTextMsg.id,
+    imageMsgIds: [],  // 模式二不注入图片消息
+    imgOk: imageDataUrls.length,
+    imgFail: images.length - imageDataUrls.length
+  };
+}
+
+// ============================================================
+// 自动删除：10 条后删除注入内容
+// ============================================================
+async function checkAutoDelete() {
+  if (!runtime.deleteTextEnabled && !runtime.deleteImagesEnabled) return;
+  const processed = runtime.processedLinks;
+  for (const key of Object.keys(processed)) {
+    const info = processed[key];
+    if (!info || info.deleted) continue;
+    try {
+      const msgs = await getMessagesByConversation(info.convId);
+      // 计算注入后新增的消息数（排除自己注入的）
+      const newMsgs = msgs.filter(m =>
+        m.timestamp > info.injectTs &&
+        !info.imageMsgIds.includes(m.id) &&
+        m.id !== info.textMsgId
+      );
+      if (newMsgs.length >= runtime.deleteAfterCount) {
+        log(`会话 ${info.convId} 新增 ${newMsgs.length} 条，触发自动删除`, 'info');
+        if (runtime.deleteTextEnabled && info.textMsgId) {
+          try { await deleteMessage(info.textMsgId); } catch (e) {}
+        }
+        if (runtime.deleteImagesEnabled && info.imageMsgIds.length) {
+          for (const imgId of info.imageMsgIds) {
+            try { await deleteMessage(imgId); } catch (e) {}
+          }
+        }
+        info.deleted = true;
+        rocheStorage.set(STORE_KEYS.processedLinks, processed);
+        log(`已清理会话 ${info.convId} 的小红书内容`, 'success');
+      }
+    } catch (e) {}
+  }
+}
+
+// ============================================================
+// 自动监听主循环
+// ============================================================
+function extractXhsUrl(text) {
+  if (!text) return null;
+  const m = text.match(/https?:\/\/(?:www\.xiaohongshu\.com\/(?:discovery\/item\/|explore\/|note\/)?[a-zA-Z0-9]+|xhslink\.com\/[a-zA-Z0-9]+)/);
+  return m ? m[0] : null;
+}
+
+async function pollOnce() {
+  if (!runtime.autoListen || runtime.selectedIds.length === 0) return;
+  for (const convId of runtime.selectedIds) {
+    try {
+      const msgs = await getMessagesByConversation(convId);
+      const recent = msgs.slice(-20);
+      for (const m of recent) {
+        if (!m.isMe) continue;
+        if (m.type !== 'text' && m.type !== undefined) continue;
+        const url = extractXhsUrl(m.text);
+        if (!url) continue;
+        const key = `${convId}_${m.id}`;
+        if (runtime.processedLinks[key]) continue;
+        // 标记正在处理
+        runtime.processedLinks[key] = { processing: true, ts: Date.now() };
+        log(`检测到小红书链接: ${url.substring(0, 50)}...`, 'info');
+        try {
+          const result = await processXhsLinkFull(url);
+          let procResult;
+          if (runtime.mode === 2) {
+            procResult = await processMode2(m, url, result);
+          } else {
+            procResult = await processMode1(m, url, result);
+          }
+          runtime.processedLinks[key] = {
+            ts: Date.now(),
+            injectTs: m.timestamp || Date.now(),
+            convId,
+            textMsgId: procResult.textMsgId,
+            imageMsgIds: procResult.imageMsgIds,
+            mode: runtime.mode,
+            deleted: false
+          };
+          rocheStorage.set(STORE_KEYS.processedLinks, runtime.processedLinks);
+          log(`处理成功 (模式${runtime.mode}) 标题: ${result.note.title?.substring(0, 30) || '(无标题)'} (图片 ${procResult.imgOk}/${procResult.imgOk + procResult.imgFail})`, 'success');
+        } catch (e) {
+          log(`处理失败: ${e.message}`, 'error');
+          delete runtime.processedLinks[key];
+        }
+      }
+    } catch (e) {}
+  }
+}
+
+function startAutoListen() {
+  if (runtime.pollTimer) clearInterval(runtime.pollTimer);
+  runtime.pollTimer = setInterval(pollOnce, runtime.pollInterval);
+  if (runtime.cleanupTimer) clearInterval(runtime.cleanupTimer);
+  runtime.cleanupTimer = setInterval(checkAutoDelete, runtime.cleanupInterval);
+  log(`自动监听已启动 (${runtime.pollInterval}ms 间隔)`, 'info');
+}
+
+function stopAutoListen() {
+  if (runtime.pollTimer) { clearInterval(runtime.pollTimer); runtime.pollTimer = null; }
+  if (runtime.cleanupTimer) { clearInterval(runtime.cleanupTimer); runtime.cleanupTimer = null; }
+  log('自动监听已停止', 'info');
+}
+
+// ============================================================
+// 副 API 预设管理
+// ============================================================
+async function fetchModels(preset) {
+  let url = preset.baseUrl.replace(/\/$/, '');
+  if (!url.endsWith('/v1/models')) {
+    if (url.endsWith('/v1')) url += '/models';
+    else url += '/v1/models';
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${preset.apiKey}` },
+      signal: controller.signal
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${t.substring(0, 100)}`);
+    }
+    const data = await resp.json();
+    const models = (data.data || []).map(m => m.id).filter(Boolean);
+    return models.sort();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function testPreset(preset) {
+  // 发一个简单请求测试
+  let url = preset.baseUrl.replace(/\/$/, '');
+  if (!url.endsWith('/v1/chat/completions')) {
+    if (url.endsWith('/v1')) url += '/chat/completions';
+    else url += '/v1/chat/completions';
+  }
+  const body = {
+    model: preset.model,
+    messages: [{ role: 'user', content: '回复"OK"' }],
+    max_tokens: 10
+  };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${preset.apiKey}`
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${t.substring(0, 200)}`);
+    }
+    const data = await resp.json();
+    const text = data.choices?.[0]?.message?.content || '';
+    return text;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ============================================================
+// 初始化
+// ============================================================
+async function initApp(root, roche) {
+  runtime.roche = roche;
+  runtime.rootEl = root;
+  rocheStorage = {
+    get: (k) => roche.storage.get(k),
+    set: (k, v) => roche.storage.set(k, v),
+    delete: (k) => roche.storage.delete(k)
+  };
+
+  // 关键：如果之前已经启动过监听（插件 App 被关闭又打开），不要重启
+  // 保留现有的 runtime.processedLinks 等状态
+  const wasListening = runtime.autoListen && runtime.pollTimer;
+
+  // 加载配置
+  const [mode, sel, proc, auto, deleteAfter, delText, delImgs, presets, activePresetId] = await Promise.all([
+    rocheStorage.get(STORE_KEYS.mode),
+    rocheStorage.get(STORE_KEYS.selectedIds),
+    rocheStorage.get(STORE_KEYS.processedLinks),
+    rocheStorage.get(STORE_KEYS.autoListen),
+    rocheStorage.get(STORE_KEYS.deleteAfterCount),
+    rocheStorage.get(STORE_KEYS.deleteTextEnabled),
+    rocheStorage.get(STORE_KEYS.deleteImagesEnabled),
+    rocheStorage.get(STORE_KEYS.apiPresets),
+    rocheStorage.get(STORE_KEYS.activePresetId)
+  ]);
+  runtime.mode = mode || 1;
+  runtime.selectedIds = sel || [];
+  runtime.processedLinks = proc || {};
+  runtime.autoListen = !!auto;
+  runtime.deleteAfterCount = deleteAfter || 10;
+  runtime.deleteTextEnabled = delText !== false;
+  runtime.deleteImagesEnabled = delImgs !== false;
+  runtime.apiPresets = presets || [];
+  runtime.activePresetId = activePresetId || (runtime.apiPresets[0]?.id || null);
+
+  render(root);
+  bindEvents(roche);
+
+  // 关键：如果之前已经在监听（插件 App 关闭又打开），不要重启定时器
+  // 否则会导致重复定时器 + 状态丢失
+  if (!wasListening && runtime.autoListen && runtime.selectedIds.length > 0) {
+    startAutoListen();
+  } else if (wasListening) {
+    log(`检测到监听已在运行（无需重启定时器）`, 'info');
+  }
+  log('插件已加载 v2.1.0', 'success');
+}
+
+function cleanup() {
+  stopAutoListen();
+  runtime.rootEl = null;
+}
+
+// ============================================================
+// 渲染
+// ============================================================
+function render(root) {
+  root.innerHTML = `
+    <style>
+      .roche-plugin-xhs-reader { --xhs-bg:#fff;--xhs-bg-soft:#f8f9fa;--xhs-border:#e5e7eb;--xhs-text:#1f2937;--xhs-text-dim:#6b7280;--xhs-accent:#ec4899;--xhs-accent-hover:#db2777; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; font-size:14px; color:var(--xhs-text); background:var(--xhs-bg); height:100%; display:flex; flex-direction:column; }
+      .roche-plugin-xhs-reader * { box-sizing:border-box; }
+      .xhs-header { padding:12px 16px; border-bottom:1px solid var(--xhs-border); background:var(--xhs-bg-soft); }
+      .xhs-title { font-size:16px; font-weight:600; margin:0 0 4px 0; }
+      .xhs-subtitle { font-size:12px; color:var(--xhs-text-dim); margin:0; }
+      .xhs-tabs { display:flex; gap:4px; padding:8px 16px; background:var(--xhs-bg-soft); border-bottom:1px solid var(--xhs-border); }
+      .xhs-tab { padding:6px 14px; border:none; background:transparent; color:var(--xhs-text-dim); cursor:pointer; border-radius:6px; font-size:13px; }
+      .xhs-tab.active { background:var(--xhs-accent); color:white; }
+      .xhs-content { flex:1; overflow-y:auto; padding:16px; }
+      .xhs-panel { display:none; }
+      .xhs-panel.active { display:block; }
+      .xhs-field { margin-bottom:16px; }
+      .xhs-label { display:block; font-size:13px; font-weight:500; margin-bottom:6px; color:var(--xhs-text); }
+      .xhs-input { width:100%; padding:8px 10px; border:1px solid var(--xhs-border); border-radius:6px; font-size:13px; font-family:inherit; background:white; }
+      .xhs-input:focus { outline:none; border-color:var(--xhs-accent); }
+      .xhs-hint { font-size:12px; color:var(--xhs-text-dim); line-height:1.5; }
+      .xhs-btn { padding:8px 14px; border:1px solid var(--xhs-border); border-radius:6px; background:white; cursor:pointer; font-size:13px; color:var(--xhs-text); }
+      .xhs-btn:hover { background:var(--xhs-bg-soft); }
+      .xhs-btn-primary { background:var(--xhs-accent); color:white; border:none; }
+      .xhs-btn-primary:hover { background:var(--xhs-accent-hover); }
+      .xhs-btn-danger { background:#e74c3c; color:white; border:none; }
+      .xhs-btn-danger:hover { background:#c0392b; }
+      .xhs-log { font-family:'Consolas',monospace; font-size:11px; line-height:1.5; }
+      .xhs-log-line { padding:2px 0; border-bottom:1px dashed var(--xhs-border); word-break:break-all; }
+      .xhs-log-time { color:var(--xhs-text-dim); margin-right:6px; }
+      .xhs-log-info { color:var(--xhs-text); }
+      .xhs-log-success { color:#10b981; }
+      .xhs-log-error { color:#ef4444; }
+      .xhs-conv-list { max-height:240px; overflow-y:auto; border:1px solid var(--xhs-border); border-radius:6px; }
+      .xhs-conv-item { padding:8px 10px; border-bottom:1px solid var(--xhs-border); cursor:pointer; font-size:13px; }
+      .xhs-conv-item:hover { background:var(--xhs-bg-soft); }
+      .xhs-conv-item.selected { background:#fce7f3; }
+      .xhs-preset-item { padding:10px; border:1px solid var(--xhs-border); border-radius:6px; margin-bottom:8px; background:white; }
+      .xhs-preset-item.active { border-color:var(--xhs-accent); background:#fdf2f8; }
+      .xhs-row { display:flex; gap:8px; align-items:center; }
+      .xhs-row > * { flex:1; }
+      .xhs-status { padding:6px 10px; border-radius:4px; font-size:12px; background:var(--xhs-bg-soft); }
+    </style>
+    <div class="xhs-header">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+        <div style="flex:1;min-width:0;">
+          <h2 class="xhs-title">小红书链接注入器</h2>
+          <p class="xhs-subtitle">v2.1.0 · 模式${runtime.mode === 2 ? '二：副 API 总结' : '一：直注模式'}</p>
+        </div>
+        <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
+      </div>
+    </div>
+    <nav class="xhs-tabs">
+      <button class="xhs-tab ${runtime.mode === 1 ? 'active' : ''}" data-tab="main">主面板</button>
+      <button class="xhs-tab" data-tab="api">副 API</button>
+      <button class="xhs-tab" data-tab="delete">自动删除</button>
+      <button class="xhs-tab" data-tab="regex">正则文案</button>
+      <button class="xhs-tab" data-tab="settings">设置</button>
+      <button class="xhs-tab" data-tab="logs">日志</button>
+    </nav>
+    <div class="xhs-content">
+      <!-- 主面板 -->
+      <section class="xhs-panel ${runtime.mode === 1 ? 'active' : ''}" id="xhs-panel-main">
+        <div class="xhs-field">
+          <label class="xhs-label">运行模式</label>
+          <div class="xhs-row">
+            <button class="xhs-btn xhs-mode-btn ${runtime.mode === 1 ? 'xhs-btn-primary' : ''}" data-mode="1">模式一：直注（原文+图片）</button>
+            <button class="xhs-btn xhs-mode-btn ${runtime.mode === 2 ? 'xhs-btn-primary' : ''}" data-mode="2">模式二：副 API 总结</button>
+          </div>
+          <div class="xhs-hint" style="margin-top:6px;">
+            模式一：抓取笔记全文+评论，独立注入文本和图片消息（最省事，但耗 token）<br/>
+            模式二：下载图片 → 发给副 API（vision 模型）总结为 300 字左右 → 丢弃图片<br/>
+            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;最终注入：总结文本 + 评论 + 卡片占位符（user 看卡片，char 只看总结）
+          </div>
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">手动注入（粘贴小红书链接）</label>
+          <input type="text" class="xhs-input" id="xhs-link-input" placeholder="https://www.xiaohongshu.com/explore/..." />
+          <div class="xhs-row" style="margin-top:8px;">
+            <select class="xhs-input" id="xhs-conv-select">
+              <option value="">选择目标会话...</option>
+            </select>
+            <button class="xhs-btn xhs-btn-primary" id="xhs-inject-btn" style="flex:0 0 auto;">注入</button>
+          </div>
+          <button class="xhs-btn" id="xhs-preview-btn" style="width:100%;margin-top:8px;">预览抓取内容</button>
+          <div id="xhs-preview" style="margin-top:10px;padding:10px;background:var(--xhs-bg-soft);border-radius:6px;font-size:12px;display:none;white-space:pre-wrap;max-height:200px;overflow-y:auto;"></div>
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">自动监听</label>
+          <div class="xhs-row">
+            <label style="flex:0 0 auto;display:flex;align-items:center;gap:6px;cursor:pointer;">
+              <input type="checkbox" id="xhs-auto-toggle" ${runtime.autoListen ? 'checked' : ''} />
+              <span style="font-size:13px;">启用自动监听</span>
+            </label>
+            <span class="xhs-status" id="xhs-listen-status">${runtime.autoListen ? '运行中' : '已停止'}</span>
+          </div>
+          <div class="xhs-hint" style="margin-top:6px;">勾选后会自动处理勾选会话中的小红书链接（300ms 检测间隔）</div>
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">监听会话</label>
+          <div class="xhs-conv-list" id="xhs-conv-list"></div>
+        </div>
+      </section>
+
+      <!-- 副 API -->
+      <section class="xhs-panel" id="xhs-panel-api">
+        <div class="xhs-field">
+          <label class="xhs-label">当前预设</label>
+          <div class="xhs-row">
+            <select class="xhs-input" id="xhs-preset-select">
+              <option value="">未选择...</option>
+              ${runtime.apiPresets.map(p => `<option value="${p.id}" ${p.id === runtime.activePresetId ? 'selected' : ''}>${p.name}</option>`).join('')}
+            </select>
+            <button class="xhs-btn" id="xhs-new-preset" style="flex:0 0 auto;">新建</button>
+          </div>
+        </div>
+        <div id="xhs-preset-editor" style="display:none;">
+          <div class="xhs-field">
+            <label class="xhs-label">预设名称</label>
+            <input type="text" class="xhs-input" id="xhs-preset-name" placeholder="例如：默认 / OpenAI / DeepSeek" />
+          </div>
+          <div class="xhs-field">
+            <label class="xhs-label">Base URL</label>
+            <input type="text" class="xhs-input" id="xhs-preset-url" placeholder="https://api.openai.com 或 https://api.openai.com/v1" />
+            <div class="xhs-hint" style="margin-top:4px;">OpenAI 兼容接口的根地址</div>
+          </div>
+          <div class="xhs-field">
+            <label class="xhs-label">API Key</label>
+            <input type="password" class="xhs-input" id="xhs-preset-key" placeholder="sk-..." />
+          </div>
+          <div class="xhs-field">
+            <label class="xhs-label">模型</label>
+            <div class="xhs-row">
+              <input type="text" class="xhs-input" id="xhs-preset-model" placeholder="gpt-4o-mini 或点刷新获取" />
+              <button class="xhs-btn" id="xhs-refresh-models" style="flex:0 0 auto;">刷新</button>
+            </div>
+            <select class="xhs-input" id="xhs-model-list" style="margin-top:6px;display:none;" size="6"></select>
+          </div>
+          <div class="xhs-field">
+            <label class="xhs-label">Temperature</label>
+            <input type="number" class="xhs-input" id="xhs-preset-temp" value="0.5" min="0" max="2" step="0.1" />
+          </div>
+          <div class="xhs-row">
+            <button class="xhs-btn xhs-btn-primary" id="xhs-save-preset">保存预设</button>
+            <button class="xhs-btn" id="xhs-test-preset">测试连接</button>
+            <button class="xhs-btn xhs-btn-danger" id="xhs-delete-preset">删除</button>
+          </div>
+          <div id="xhs-preset-test-result" style="margin-top:10px;font-size:12px;display:none;padding:8px;border-radius:4px;"></div>
+        </div>
+        <div class="xhs-hint" style="margin-top:16px;padding:10px;background:var(--xhs-bg-soft);border-radius:6px;">
+          <strong>使用说明：</strong><br/>
+          1. 新建预设 → 填 Base URL + API Key → 点刷新获取模型列表<br/>
+          2. 选模型 → 保存预设（模型必须支持 vision 多模态）<br/>
+          3. 在主面板切到「模式二」即可启用副 API 总结<br/>
+          4. 模式二会下载笔记图片 → 一起发给副 API 总结（300 字左右）→ 丢弃图片
+        </div>
+      </section>
+
+      <!-- 自动删除 -->
+      <section class="xhs-panel" id="xhs-panel-delete">
+        <div class="xhs-field">
+          <label class="xhs-label">自动删除功能</label>
+          <div class="xhs-hint" style="margin-bottom:10px;">注入小红书内容后，当该会话新增指定条数消息时自动删除注入的内容（避免长期占用 token）</div>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px;">
+            <input type="checkbox" id="xhs-del-text-toggle" ${runtime.deleteTextEnabled ? 'checked' : ''} />
+            <span>自动删除注入的文本消息</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" id="xhs-del-img-toggle" ${runtime.deleteImagesEnabled ? 'checked' : ''} />
+            <span>自动删除注入的图片消息</span>
+          </label>
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">触发条数</label>
+          <div class="xhs-row">
+            <input type="number" class="xhs-input" id="xhs-del-count" value="${runtime.deleteAfterCount}" min="1" max="100" />
+            <span class="xhs-hint">条消息后删除</span>
+          </div>
+        </div>
+        <button class="xhs-btn xhs-btn-danger" id="xhs-clean-bad-images" style="width:100%;margin-top:20px;">扫描并清理坏图片消息（v1.4.2 之前）</button>
+        <div id="xhs-clean-result" style="margin-top:8px;font-size:12px;"></div>
+      </section>
+
+      <!-- 正则文案 -->
+      <section class="xhs-panel" id="xhs-panel-regex">
+        <div class="xhs-hint" style="margin-bottom:12px;padding:10px;background:#fff3cd;border-radius:6px;color:#856404;">
+          把以下两段正则配置复制到 Roche 的「正则替换」设置里，即可让模式二的消息渲染成精美卡片，同时把 AI 上下文隐藏起来。
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">正则 1：渲染 XHS_CARD 为卡片（user 可见）</label>
+          <textarea class="xhs-input" readonly rows="8" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">匹配：[XHS_CARD]([\\s\\S]*?)[/XHS_CARD]
+替换：
+<div style="margin:8px 0;padding:12px;border-radius:12px;background:linear-gradient(135deg,#fff,#fdf2f8);border:1px solid #fce7f3;box-shadow:0 2px 8px rgba(236,72,153,0.1);">
+$1
+</div></textarea>
+          <div class="xhs-hint" style="margin-top:4px;">此正则会把 [XHS_CARD]...[/XHS_CARD] 包成卡片容器，你可以进一步自定义内部样式。</div>
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">正则 2：把卡片内容渲染为可读格式</label>
+          <textarea class="xhs-input" readonly rows="12" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">匹配：title=(.*?)\\nimages=(.*?)\\npreview=(.*?)\\ntags=(.*?)(?=\\n|$)
+替换：
+<div style="font-weight:600;font-size:15px;margin-bottom:8px;">$1</div>
+<div id="xhs-imgs-$1" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;"></div>
+<script>
+(function(){
+  var imgs='$2'.split(',');
+  var box=document.querySelector('#xhs-imgs-$1');
+  if(!box)return;
+  imgs.forEach(function(u){
+    if(!u)return;
+    var img=document.createElement('img');
+    img.src=u;img.style='width:80px;height:80px;object-fit:cover;border-radius:6px;';
+    box.appendChild(img);
+  });
+})();
+</script>
+<div style="font-size:13px;color:#666;margin:8px 0;">$3</div>
+<div style="font-size:12px;color:#ec4899;">$4</div></textarea>
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">正则 3：隐藏 [笔记总结] 和 [用户评论] 标签</label>
+          <textarea class="xhs-input" readonly rows="4" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">匹配：\\[(笔记总结|用户评论|/笔记总结|/用户评论)\\]
+替换：（留空）</textarea>
+          <div class="xhs-hint" style="margin-top:4px;">这样 char 看到的是纯文本段落，user 也不看到奇怪的方括号标签。</div>
+        </div>
+      </section>
+
+      <!-- 设置 -->
+      <section class="xhs-panel" id="xhs-panel-settings">
+        <div class="xhs-field">
+          <label class="xhs-label">Cloudflare Worker 代理地址（可选）</label>
+          <input type="text" class="xhs-input" id="xhs-cf-worker" placeholder="https://xxx.your-name.workers.dev" />
+          <div class="xhs-hint" style="margin-top:6px;">模式一和模式二下载图片时都会使用（绕过小红书防盗链）。留空则使用公共代理。</div>
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">Worker 部署教程</label>
+          <div style="font-size:12px;color:var(--xhs-text-dim);line-height:1.7;padding:10px;background:var(--xhs-bg-soft);border:1px solid var(--xhs-border);border-radius:8px;">
+            1. 注册 <a href="https://dash.cloudflare.com" target="_blank" style="color:var(--xhs-accent);">Cloudflare</a>（免费）<br/>
+            2. 左侧菜单 Workers 和 Pages → 创建<br/>
+            3. 创建 Worker → 起名 → 粘贴脚本 → 部署<br/>
+            4. 复制地址填到上面 → 保存
+          </div>
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">Worker 脚本（复制这段）</label>
+          <textarea class="xhs-input" readonly rows="10" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const target = url.searchParams.get('url');
+    if (!target) return new Response('missing url', { status: 400 });
+    const resp = await fetch(target, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.xiaohongshu.com/' }
+    });
+    const body = await resp.arrayBuffer();
+    const headers = new Headers(resp.headers);
+    headers.set('Access-Control-Allow-Origin', '*');
+    return new Response(body, { status: resp.status, headers });
+  }
+}</textarea>
+        </div>
+        <button class="xhs-btn xhs-btn-primary" id="xhs-save-settings" style="width:100%;">保存设置</button>
+      </section>
+
+      <!-- 日志 -->
+      <section class="xhs-panel" id="xhs-panel-logs">
+        <div class="xhs-log" id="xhs-logs"></div>
+      </section>
+    </div>
+  `;
+}
+
+function renderLogs() {
+  const el = runtime.rootEl?.querySelector('#xhs-logs');
+  if (!el) return;
+  if (runtime.logs.length === 0) {
+    el.innerHTML = '<div style="color:var(--xhs-text-dim);font-size:12px;">暂无日志</div>';
+    return;
+  }
+  el.innerHTML = runtime.logs.slice(-100).map(l => {
+    const cls = `xhs-log-${l.type}`;
+    return `<div class="xhs-log-line"><span class="xhs-log-time">${l.time}</span><span class="${cls}">${l.msg}</span></div>`;
+  }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+async function renderConversationList() {
+  const el = runtime.rootEl?.querySelector('#xhs-conv-list');
+  const selectEl = runtime.rootEl?.querySelector('#xhs-conv-select');
+  if (!el) return;
+  try {
+    const conversations = await getAllRecords('conversations');
+    // 同步到下拉框
+    if (selectEl) {
+      const current = selectEl.value;
+      selectEl.innerHTML = '<option value="">选择目标会话...</option>' +
+        conversations.map(c => {
+          const id = c.id || c.conversationId;
+          const name = c.name || c.title || c.handle || id;
+          return `<option value="${id}">${name}</option>`;
+        }).join('');
+      selectEl.value = current;
+    }
+    el.innerHTML = conversations.map(c => {
+      const id = c.id || c.conversationId;
+      const name = c.name || c.title || c.handle || id;
+      const selected = runtime.selectedIds.includes(id);
+      return `<div class="xhs-conv-item ${selected ? 'selected' : ''}" data-id="${id}">${name}</div>`;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = `<div style="color:#e74c3c;font-size:12px;">加载失败: ${e.message}</div>`;
+  }
+}
+
+// ============================================================
+// 事件绑定
+// ============================================================
+function bindEvents(roche) {
+  const root = runtime.rootEl;
+  if (!root) return;
+
+  // 退出按钮：关闭插件面板（监听继续运行，因为 unmount 不停止定时器）
+  const closeBtn = root.querySelector('#xhs-close-btn');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      try {
+        if (roche.ui?.closeApp) {
+          roche.ui.closeApp();
+        } else if (roche.ui?.close) {
+          roche.ui.close();
+        } else {
+          log('未找到 roche.ui.closeApp 方法', 'error');
+        }
+      } catch (e) {
+        log(`退出失败: ${e.message}`, 'error');
+      }
+    });
+  }
+
+  // Tab 切换
+  root.querySelectorAll('.xhs-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tab = btn.dataset.tab;
+      root.querySelectorAll('.xhs-tab').forEach(b => b.classList.remove('active'));
+      root.querySelectorAll('.xhs-panel').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      root.querySelector(`#xhs-panel-${tab}`).classList.add('active');
+      if (tab === 'main' || tab === 'logs') renderLogs();
+      if (tab === 'main') renderConversationList();
+    });
+  });
+
+  // 模式切换
+  root.querySelectorAll('.xhs-mode-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const mode = parseInt(btn.dataset.mode);
+      runtime.mode = mode;
+      await rocheStorage.set(STORE_KEYS.mode, mode);
+      root.querySelectorAll('.xhs-mode-btn').forEach(b => {
+        b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
+      });
+      const sub = root.querySelector('.xhs-subtitle');
+      if (sub) sub.textContent = `v2.1.0 · 模式${mode === 2 ? '二：副 API 总结' : '一：直注模式'}`;
+      roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
+      log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
+    });
+  });
+
+  // 加载 CF Worker 配置
+  (async () => {
+    try {
+      const savedCfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
+      if (savedCfWorker && root.querySelector('#xhs-cf-worker')) {
+        root.querySelector('#xhs-cf-worker').value = savedCfWorker;
+      }
+    } catch (e) {}
+  })();
+
+  // 保存 CF Worker
+  root.querySelector('#xhs-save-settings').addEventListener('click', async () => {
+    const workerUrl = root.querySelector('#xhs-cf-worker').value.trim();
+    await rocheStorage.set(STORE_KEYS.cfWorker, workerUrl);
+    if (workerUrl) {
+      roche.ui.toast('已保存 CF Worker 地址');
+    } else {
+      roche.ui.toast('已清空，将使用公共代理');
+    }
+  });
+
+  // 会话列表点击
+  root.querySelector('#xhs-conv-list').addEventListener('click', async (e) => {
+    const item = e.target.closest('.xhs-conv-item');
+    if (!item) return;
+    const id = item.dataset.id;
+    const idx = runtime.selectedIds.indexOf(id);
+    if (idx >= 0) runtime.selectedIds.splice(idx, 1);
+    else runtime.selectedIds.push(id);
+    await rocheStorage.set(STORE_KEYS.selectedIds, runtime.selectedIds);
+    renderConversationList();
+    const status = root.querySelector('#xhs-listen-status');
+    if (status) status.textContent = runtime.autoListen && runtime.selectedIds.length > 0 ? '运行中' : '已停止';
+  });
+
+  // 自动监听开关
+  root.querySelector('#xhs-auto-toggle').addEventListener('change', async (e) => {
+    runtime.autoListen = e.target.checked;
+    await rocheStorage.set(STORE_KEYS.autoListen, runtime.autoListen);
+    if (runtime.autoListen) {
+      if (runtime.selectedIds.length === 0) {
+        roche.ui.toast('请先勾选要监听的会话');
+        runtime.autoListen = false;
+        e.target.checked = false;
+        await rocheStorage.set(STORE_KEYS.autoListen, false);
+        return;
+      }
+      startAutoListen();
+    } else {
+      stopAutoListen();
+    }
+    const status = root.querySelector('#xhs-listen-status');
+    if (status) status.textContent = runtime.autoListen ? '运行中' : '已停止';
+  });
+
+  // 预览
+  root.querySelector('#xhs-preview-btn').addEventListener('click', async () => {
+    const link = root.querySelector('#xhs-link-input').value.trim();
+    if (!link) { roche.ui.toast('请输入链接'); return; }
+    if (!/xhslink\.com|xiaohongshu\.com/.test(link)) {
+      roche.ui.toast('不是小红书链接'); return;
+    }
+    const previewEl = root.querySelector('#xhs-preview');
+    previewEl.style.display = 'block';
+    previewEl.textContent = '抓取中...';
+    try {
+      const result = await processXhsLinkFull(link);
+      const { note, comments, images, tags, preview } = result;
+      const sharerName = await getSharerName();
+      let text;
+      if (runtime.mode === 2) {
+        // 模式二预览也下载图片并发给副 API 总结（与实际注入行为一致）
+        previewEl.textContent = '模式二: 下载图片中...';
+        const imageDataUrls = [];
+        for (let i = 0; i < images.length; i++) {
+          try {
+            const d = await downloadImageAsDataUrl(images[i].url);
+            imageDataUrls.push(d);
+          } catch (e) {}
+        }
+        const summary = await summarizeNote(note, comments, imageDataUrls);
+        text = formatNoteMode2(note, comments, summary, sharerName);
+      } else {
+        text = formatNoteMode1(note, comments, sharerName);
+      }
+      previewEl.textContent = text + `\n\n---\n图片数: ${images.length}, 标签: ${tags.join(', ')}`;
+    } catch (e) {
+      previewEl.textContent = `失败: ${e.message}`;
+    }
+  });
+
+  // 手动注入
+  root.querySelector('#xhs-inject-btn').addEventListener('click', async () => {
+    const link = root.querySelector('#xhs-link-input').value.trim();
+    const convId = root.querySelector('#xhs-conv-select').value;
+    if (!link) { roche.ui.toast('请输入链接'); return; }
+    if (!convId) { roche.ui.toast('请选择会话'); return; }
+    if (!/xhslink\.com|xiaohongshu\.com/.test(link)) {
+      roche.ui.toast('不是小红书链接'); return;
+    }
+    roche.ui.toast('正在抓取...');
+    try {
+      const result = await processXhsLinkFull(link);
+      const now = Date.now();
+      const fakeMsg = {
+        id: genMsgId(),
+        text: link,
+        isMe: true,
+        type: 'text',
+        timestamp: now,
+        conversationId: convId,
+        senderId: 'me'
+      };
+      let procResult;
+      if (runtime.mode === 2) {
+        procResult = await processMode2(fakeMsg, link, result);
+      } else {
+        procResult = await processMode1(fakeMsg, link, result);
+      }
+      roche.ui.toast(`注入成功（图片 ${procResult.imgOk}/${procResult.imgOk + procResult.imgFail}）`);
+      log(`手动注入成功到 ${convId} (图片 ${procResult.imgOk}/${procResult.imgOk + procResult.imgFail})`, 'success');
+    } catch (e) {
+      roche.ui.toast('注入失败: ' + e.message);
+      log(`手动注入失败: ${e.message}`, 'error');
+    }
+  });
+
+  // 自动删除设置
+  root.querySelector('#xhs-del-text-toggle').addEventListener('change', async (e) => {
+    runtime.deleteTextEnabled = e.target.checked;
+    await rocheStorage.set(STORE_KEYS.deleteTextEnabled, runtime.deleteTextEnabled);
+    roche.ui.toast(runtime.deleteTextEnabled ? '已开启自动删文本' : '已关闭自动删文本');
+  });
+  root.querySelector('#xhs-del-img-toggle').addEventListener('change', async (e) => {
+    runtime.deleteImagesEnabled = e.target.checked;
+    await rocheStorage.set(STORE_KEYS.deleteImagesEnabled, runtime.deleteImagesEnabled);
+    roche.ui.toast(runtime.deleteImagesEnabled ? '已开启自动删图片' : '已关闭自动删图片');
+  });
+  root.querySelector('#xhs-del-count').addEventListener('change', async (e) => {
+    const n = parseInt(e.target.value) || 10;
+    runtime.deleteAfterCount = n;
+    await rocheStorage.set(STORE_KEYS.deleteAfterCount, n);
+    roche.ui.toast(`已设置: ${n} 条后删除`);
+  });
+
+  // 清理坏图片消息
+  root.querySelector('#xhs-clean-bad-images').addEventListener('click', async () => {
+    const resultEl = root.querySelector('#xhs-clean-result');
+    const btn = root.querySelector('#xhs-clean-bad-images');
+    const ok = await roche.ui.confirm({
+      title: '清理坏图片消息',
+      message: '将扫描所有会话，删除 id 为数字类型的图片消息。不可恢复，确定继续吗？'
+    });
+    if (!ok) return;
+    btn.disabled = true;
+    btn.textContent = '扫描中...';
+    resultEl.textContent = '正在扫描...';
+    try {
+      const conversations = await getAllRecords('conversations');
+      let totalScanned = 0, totalBad = 0, totalDeleted = 0;
+      const badIds = [];
+      for (const conv of conversations) {
+        const convId = conv.id || conv.conversationId;
+        if (!convId) continue;
+        let msgs;
+        try { msgs = await getMessagesByConversation(convId); } catch (e) { continue; }
+        totalScanned += msgs.length;
+        for (const m of msgs) {
+          if (m.type === 'image' && typeof m.id === 'number') {
+            badIds.push(m.id);
+            totalBad++;
+          }
+        }
+      }
+      if (badIds.length === 0) {
+        resultEl.textContent = `扫描 ${totalScanned} 条，未找到坏图片消息。`;
+        resultEl.style.color = '#10b981';
+      } else {
+        for (const id of badIds) {
+          try { await deleteMessage(id); totalDeleted++; } catch (e) {}
+        }
+        resultEl.textContent = `扫描 ${totalScanned} 条，找到 ${totalBad} 条坏消息，删除 ${totalDeleted} 条。`;
+        resultEl.style.color = '#10b981';
+        roche.ui.toast(`已清理 ${totalDeleted} 条坏图片消息`);
+      }
+    } catch (e) {
+      resultEl.textContent = `失败: ${e.message}`;
+      resultEl.style.color = '#e74c3c';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '扫描并清理坏图片消息（v1.4.2 之前）';
+    }
+  });
+
+  // ===== 副 API 预设管理 =====
+  // 新建预设
+  root.querySelector('#xhs-new-preset').addEventListener('click', () => {
+    root.querySelector('#xhs-preset-editor').style.display = 'block';
+    root.querySelector('#xhs-preset-name').value = '';
+    root.querySelector('#xhs-preset-url').value = '';
+    root.querySelector('#xhs-preset-key').value = '';
+    root.querySelector('#xhs-preset-model').value = '';
+    root.querySelector('#xhs-preset-temp').value = '0.5';
+    root.querySelector('#xhs-model-list').style.display = 'none';
+    root.querySelector('#xhs-preset-test-result').style.display = 'none';
+    root.dataset.editingPresetId = '';
+  });
+
+  // 选择预设
+  root.querySelector('#xhs-preset-select').addEventListener('change', (e) => {
+    const id = e.target.value;
+    runtime.activePresetId = id || null;
+    rocheStorage.set(STORE_KEYS.activePresetId, runtime.activePresetId);
+    const preset = runtime.apiPresets.find(p => p.id === id);
+    if (preset) {
+      root.querySelector('#xhs-preset-editor').style.display = 'block';
+      root.querySelector('#xhs-preset-name').value = preset.name;
+      root.querySelector('#xhs-preset-url').value = preset.baseUrl;
+      root.querySelector('#xhs-preset-key').value = preset.apiKey;
+      root.querySelector('#xhs-preset-model').value = preset.model;
+      root.querySelector('#xhs-preset-temp').value = preset.temperature ?? 0.5;
+      root.dataset.editingPresetId = id;
+    } else {
+      root.querySelector('#xhs-preset-editor').style.display = 'none';
+    }
+  });
+
+  // 刷新模型列表
+  root.querySelector('#xhs-refresh-models').addEventListener('click', async () => {
+    const baseUrl = root.querySelector('#xhs-preset-url').value.trim();
+    const apiKey = root.querySelector('#xhs-preset-key').value.trim();
+    if (!baseUrl || !apiKey) { roche.ui.toast('请先填 Base URL 和 API Key'); return; }
+    const btn = root.querySelector('#xhs-refresh-models');
+    btn.disabled = true;
+    btn.textContent = '获取中...';
+    try {
+      const models = await fetchModels({ baseUrl, apiKey });
+      const listEl = root.querySelector('#xhs-model-list');
+      listEl.innerHTML = models.map(m => `<option value="${m}">${m}</option>`).join('');
+      listEl.style.display = 'block';
+      listEl.size = Math.min(8, models.length);
+      listEl.addEventListener('change', () => {
+        root.querySelector('#xhs-preset-model').value = listEl.value;
+      });
+      roche.ui.toast(`获取到 ${models.length} 个模型`);
+    } catch (e) {
+      roche.ui.toast('获取失败: ' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '刷新';
+    }
+  });
+
+  // 保存预设
+  root.querySelector('#xhs-save-preset').addEventListener('click', async () => {
+    const name = root.querySelector('#xhs-preset-name').value.trim();
+    const baseUrl = root.querySelector('#xhs-preset-url').value.trim();
+    const apiKey = root.querySelector('#xhs-preset-key').value.trim();
+    const model = root.querySelector('#xhs-preset-model').value.trim();
+    const temperature = parseFloat(root.querySelector('#xhs-preset-temp').value) || 0.5;
+    if (!name || !baseUrl || !apiKey || !model) {
+      roche.ui.toast('请填写所有必填项');
+      return;
+    }
+    const editId = root.dataset.editingPresetId;
+    if (editId) {
+      const idx = runtime.apiPresets.findIndex(p => p.id === editId);
+      if (idx >= 0) {
+        runtime.apiPresets[idx] = { ...runtime.apiPresets[idx], name, baseUrl, apiKey, model, temperature };
+      }
+    } else {
+      const newPreset = { id: `p_${Date.now()}`, name, baseUrl, apiKey, model, temperature };
+      runtime.apiPresets.push(newPreset);
+      runtime.activePresetId = newPreset.id;
+      await rocheStorage.set(STORE_KEYS.activePresetId, newPreset.id);
+      root.dataset.editingPresetId = newPreset.id;
+    }
+    await rocheStorage.set(STORE_KEYS.apiPresets, runtime.apiPresets);
+    // 刷新下拉
+    const select = root.querySelector('#xhs-preset-select');
+    select.innerHTML = '<option value="">未选择...</option>' +
+      runtime.apiPresets.map(p => `<option value="${p.id}" ${p.id === runtime.activePresetId ? 'selected' : ''}>${p.name}</option>`).join('');
+    select.value = runtime.activePresetId;
+    roche.ui.toast('预设已保存');
+    log(`预设已保存: ${name} (${model})`, 'success');
+  });
+
+  // 测试连接
+  root.querySelector('#xhs-test-preset').addEventListener('click', async () => {
+    const baseUrl = root.querySelector('#xhs-preset-url').value.trim();
+    const apiKey = root.querySelector('#xhs-preset-key').value.trim();
+    const model = root.querySelector('#xhs-preset-model').value.trim();
+    if (!baseUrl || !apiKey || !model) { roche.ui.toast('请先填完整'); return; }
+    const btn = root.querySelector('#xhs-test-preset');
+    btn.disabled = true;
+    btn.textContent = '测试中...';
+    const resultEl = root.querySelector('#xhs-preset-test-result');
+    resultEl.style.display = 'block';
+    resultEl.style.background = '#f3f4f6';
+    resultEl.textContent = '正在测试...';
+    try {
+      const reply = await testPreset({ baseUrl, apiKey, model });
+      resultEl.style.background = '#d1fae5';
+      resultEl.style.color = '#065f46';
+      resultEl.textContent = `成功！模型回复: ${reply}`;
+      roche.ui.toast('测试通过');
+    } catch (e) {
+      resultEl.style.background = '#fee2e2';
+      resultEl.style.color = '#991b1b';
+      resultEl.textContent = `失败: ${e.message}`;
+      roche.ui.toast('测试失败');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '测试连接';
+    }
+  });
+
+  // 删除预设
+  root.querySelector('#xhs-delete-preset').addEventListener('click', async () => {
+    const editId = root.dataset.editingPresetId;
+    if (!editId) { roche.ui.toast('请先选择要删除的预设'); return; }
+    const ok = await roche.ui.confirm({
+      title: '删除预设',
+      message: '确定要删除这个预设吗？'
+    });
+    if (!ok) return;
+    runtime.apiPresets = runtime.apiPresets.filter(p => p.id !== editId);
+    if (runtime.activePresetId === editId) {
+      runtime.activePresetId = runtime.apiPresets[0]?.id || null;
+      await rocheStorage.set(STORE_KEYS.activePresetId, runtime.activePresetId);
+    }
+    await rocheStorage.set(STORE_KEYS.apiPresets, runtime.apiPresets);
+    const select = root.querySelector('#xhs-preset-select');
+    select.innerHTML = '<option value="">未选择...</option>' +
+      runtime.apiPresets.map(p => `<option value="${p.id}" ${p.id === runtime.activePresetId ? 'selected' : ''}>${p.name}</option>`).join('');
+    root.querySelector('#xhs-preset-editor').style.display = 'none';
+    roche.ui.toast('预设已删除');
+  });
+
+  // 初始化会话列表
+  renderConversationList();
+  renderLogs();
+}
