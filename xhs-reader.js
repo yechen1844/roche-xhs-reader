@@ -1,17 +1,17 @@
 /**
- * Roche 小红书链接注入器 v2.4.2
+ * Roche 小红书链接注入器 v2.5.0
  *
  * 模式一（直注模式）：原文 + 独立图片消息
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
  *                            注入：总结文本（详尽，500字左右）+ 评论 + 卡片占位符
  *
- * v2.4.2 关键改进：
- *   1. 关闭面板不停止监听（后台继续运行）
- *   2. 恢复 autoListen 状态自动重启
- *   3. HTML 抓取代理 corsproxy 优先
- *   4. 会话上限 3 个
- *   5. extractXhsUrl 修复反引号/多段路径匹配
- *   6. refreshRocheChat 深搜 Pinia store + 直接读 IndexedDB + splice
+ * v2.5.0 关键改进（解决 APK vs 浏览器代理行为差异）：
+ *   1. 新增 isApkWebView() 环境检测（UA 含 wv / Android Version）
+ *   2. 新增 smartFetch() 区分真 HTTP 错误 vs CORS 拦截（TypeError 识别）
+ *   3. 浏览器环境用 allorigins JSON 模式优先（CORS 头最完整）
+ *   4. APK 环境保持原代理顺序（已验证可用）
+ *   5. 显式 mode:'cors' + credentials:'omit' + redirect:'follow'
+ *   6. 关闭面板不停止监听 / 恢复 autoListen / 会话上限 3 个（v2.4.x 特性保留）
  *
  * 触发方式：监听消息库，用户回车后 2s 内立即替换
  * 重要：关闭面板后监听继续在后台运行
@@ -20,7 +20,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.4.2",
+  version: "2.5.0",
   apps: [
     {
       id: "xhs-reader-home",
@@ -151,10 +151,142 @@ function log(msg, type = 'info') {
 }
 
 // ============================================================
-// 小红书抓取（不变）
+// 环境检测 + 智能代理（解决 APK vs 浏览器行为差异）
+// ============================================================
+
+/**
+ * 检测当前运行环境是否为 Android WebView（APK 环境）
+ * APK WebView 的 UA 通常包含 "wv" 或 "Android" + "Version"
+ *
+ * 关键差异：
+ * - APK WebView 通常关闭 CORS 检查 → 任何代理都能用
+ * - 浏览器强制 CORS 检查 → 只有用 CORS 友好的代理才能读到响应
+ */
+function isApkWebView() {
+  try {
+    const ua = navigator.userAgent || '';
+    // Android WebView 标识：含 "wv" 或 "Android.*Version/\d"
+    if (/Android.*wv/i.test(ua)) return true;
+    if (/Android.*Version\/\d/i.test(ua)) return true;
+    // 含 Chrome 但不带完整 Chrome 版本号（WebView 特征）
+    if (/Android.*Chrome\/[\d.]+.*Mobile/i.test(ua) && !/Chrome\/\d+\.\d+\.\d+\.\d+\sMobile/i.test(ua)) {
+      // 仅作辅助判断，可能误判，保守起见需要同时满足 wv 标识
+    }
+    return false;
+  } catch (e) { return false; }
+}
+
+/**
+ * 检测当前是否为浏览器打开的本地 HTML 文件（最严苛的 CORS 环境）
+ * file:// 协议下 Origin 为 null，代理最容易拒绝
+ */
+function isBrowserLocalFile() {
+  try {
+    return location.protocol === 'file:';
+  } catch (e) { return false; }
+}
+
+/**
+ * 智能抓取 - 区分真 HTTP 错误 vs CORS 拦截
+ *
+ * 浏览器中：
+ * - 真 HTTP 错误（403/408）：resp.status 有值，resp.ok === false
+ * - CORS 拦截：fetch 直接抛 TypeError "Failed to fetch"，看不到响应
+ *
+ * APK 中：
+ * - 几乎所有错误都能看到 resp.status（CORS 被关闭）
+ */
+async function smartFetch(proxyUrl, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const opts = Object.assign({
+      signal: controller.signal,
+      mode: 'cors',           // 显式声明跨域
+      credentials: 'omit',    // 不带 Cookie，避免缓存干扰
+      redirect: 'follow'      // 跟随重定向
+    }, options);
+    const resp = await fetch(proxyUrl, opts);
+    clearTimeout(timeout);
+    return { ok: true, resp, error: null };
+  } catch (e) {
+    clearTimeout(timeout);
+    let errType;
+    if (e.name === 'AbortError') {
+      errType = `超时(${timeoutMs/1000}s)`;
+    } else if (e instanceof TypeError && /Failed to fetch|NetworkError|Load failed/i.test(e.message)) {
+      // 浏览器 CORS 拦截的典型表现：TypeError: Failed to fetch
+      errType = `CORS拦截(${e.message})`;
+    } else {
+      errType = e.message || e.name;
+    }
+    return { ok: false, resp: null, error: errType };
+  }
+}
+
+/**
+ * 返回 HTML 抓取的代理列表（按环境排序）
+ *
+ * APK 环境：保持原顺序（corsproxy 优先，已验证可用）
+ * 浏览器环境：allorigins JSON 模式优先（CORS 头最友好）
+ */
+function getHtmlProxies() {
+  const isApk = isApkWebView();
+  if (isApk) {
+    log(`环境检测: APK WebView (UA: ${(navigator.userAgent||'').substring(0,50)}...)`, 'info');
+    return [
+      { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
+      { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
+      { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
+      { name: 'allorigins-raw', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` }
+    ];
+  }
+  // 浏览器环境（含本地 file://）
+  log(`环境检测: 浏览器 (本地文件: ${isBrowserLocalFile()})`, 'info');
+  return [
+    // allorigins JSON 模式 - 返回 {contents: "..."}，CORS 头最完整
+    { name: 'allorigins-json', fn: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, jsonMode: true },
+    // codetabs - 长期稳定，CORS 支持好
+    { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
+    // thingproxy
+    { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
+    // allorigins raw 模式（备用）
+    { name: 'allorigins-raw', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+    // corsproxy 最后（对浏览器最不友好）
+    { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` }
+  ];
+}
+
+/**
+ * 返回图片下载的代理列表（按环境排序）
+ */
+function getImageProxies(cfWorker) {
+  const proxies = [];
+  // CF Worker 始终优先（用户自部署，最稳定）
+  if (cfWorker) {
+    proxies.push({ name: 'CF-Worker', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+  }
+  if (isApkWebView()) {
+    // APK 环境：原顺序
+    proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
+    proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
+    proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
+    proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
+  } else {
+    // 浏览器环境：allorigins 优先（CORS 友好）
+    proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
+    proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
+    proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
+    proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
+  }
+  return proxies;
+}
+
+// ============================================================
+// 小红书抓取
 // ============================================================
 const CORS_PROXIES = [
-  // 按用户要求：前两个代理（allorigins, corsproxy）总是失败，跳过，从第三个开始
+  // 兼容旧引用（实际逻辑由 getHtmlProxies/getImageProxies 动态生成）
   (url) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`,
   (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
   (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
@@ -162,31 +294,25 @@ const CORS_PROXIES = [
 ];
 
 async function fetchXhsHtml(xhsUrl) {
-  // 注意：CF Worker 不适合抓 HTML 页面（它带了图片专用 Accept 头，会被小红书拒绝）
-  // CF Worker 只用于下载图片。HTML 抓取只用公共代理。
-  // allorigins 放首位——名字就是"all origins"，对浏览器 Origin 头最宽容
-  const proxies = [
-    { name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
-    { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
-    { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
-    { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` }
-  ];
+  // 根据环境动态选择代理顺序
+  const proxies = getHtmlProxies();
 
   let lastErr = null;
   const errors = [];
   for (let i = 0; i < proxies.length; i++) {
     const proxyName = proxies[i].name;
     const proxyUrl = proxies[i].fn(xhsUrl);
+    const isJsonMode = proxies[i].jsonMode === true;
     try {
       log(`fetchXhsHtml: [${proxyName}] 尝试: ${proxyUrl.substring(0, 80)}...`, 'info');
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
-      const resp = await fetch(proxyUrl, {
-        signal: controller.signal,
-        mode: 'cors',            // 显式 CORS 模式，避免浏览器自动降级
-        credentials: 'omit'     // 不发 cookie，减少代理拒绝概率
-      });
-      clearTimeout(timeout);
+      const result = await smartFetch(proxyUrl, {}, 15000);
+      if (!result.ok) {
+        log(`fetchXhsHtml: [${proxyName}] ${result.error}`, 'error');
+        errors.push(`${proxyName}: ${result.error}`);
+        lastErr = new Error(result.error);
+        continue;
+      }
+      const resp = result.resp;
       if (!resp.ok) {
         const err = `HTTP ${resp.status}`;
         log(`fetchXhsHtml: [${proxyName}] ${err}`, 'error');
@@ -194,7 +320,20 @@ async function fetchXhsHtml(xhsUrl) {
         lastErr = new Error(err);
         continue;
       }
-      const html = await resp.text();
+      let html;
+      if (isJsonMode) {
+        // allorigins /get 返回 JSON: { contents: "...", status: {...} }
+        const data = await resp.json();
+        if (data && typeof data.contents === 'string') {
+          html = data.contents;
+        } else {
+          lastErr = new Error('allorigins-json: contents 字段缺失');
+          errors.push(`${proxyName}: contents 缺失`);
+          continue;
+        }
+      } else {
+        html = await resp.text();
+      }
       log(`fetchXhsHtml: [${proxyName}] OK, ${html.length} 字节`, 'success');
       if (html && html.includes('__INITIAL_STATE__')) return html;
       lastErr = new Error('页面未包含 __INITIAL_STATE__');
@@ -282,15 +421,8 @@ function extractPreview(note, maxLen = 100) {
 
 async function downloadImageAsDataUrl(imageUrl) {
   const cfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
-  const proxies = [];
-  if (cfWorker) {
-    proxies.push({ name: 'CF-Worker', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-  }
-  // CF Worker 优先，allorigins 其次（对浏览器 Origin 头最宽容）
-  proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
-  proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
-  proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
-  proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
+  // 按环境动态选择代理顺序
+  const proxies = getImageProxies(cfWorker);
 
   const errors = [];
   for (let i = 0; i < proxies.length; i++) {
@@ -298,14 +430,13 @@ async function downloadImageAsDataUrl(imageUrl) {
     const proxyUrl = proxies[i].fn(imageUrl);
     try {
       log(`  [${proxyName}] 尝试下载`, 'info');
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 20000);
-      const resp = await fetch(proxyUrl, {
-        signal: controller.signal,
-        mode: 'cors',
-        credentials: 'omit'
-      });
-      clearTimeout(timeout);
+      const result = await smartFetch(proxyUrl, {}, 20000);
+      if (!result.ok) {
+        log(`  [${proxyName}] ${result.error}`, 'error');
+        errors.push(`${proxyName}: ${result.error}`);
+        continue;
+      }
+      const resp = result.resp;
       if (!resp.ok) {
         const err = `HTTP ${resp.status}`;
         log(`  [${proxyName}] ${err}`, 'error');

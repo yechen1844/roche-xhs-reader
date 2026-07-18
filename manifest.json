@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.4.1",
-  "description": "小红书链接注入器 v2.4.1：1)关闭面板不停监听 2)恢复autoListen自动重启 3)corsproxy优先 4)会话上限3个 5)修复extractXhsUrl反引号/多段路径 6)级联延时事件派发刷新Roche UI",
+  "version": "2.5.0",
+  "description": "小红书链接注入器 v2.5.0：解决 APK vs 浏览器代理行为差异。新增 isApkWebView() 环境检测、smartFetch() 区分 CORS 拦截 vs 真 HTTP 错误、浏览器环境用 allorigins JSON 模式优先、APK 环境保持原代理顺序。保留 v2.4.x 特性：关闭面板不停监听/autoListen 恢复/会话上限 3 个/extractXhsUrl 反引号修复",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",
