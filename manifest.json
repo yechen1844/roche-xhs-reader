@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.2.0",
-  "description": "小红书链接注入器 v2.2：模式一直注原文+图片，模式二下载图片→发给副API vision模型详尽总结（500字左右，不省略关键信息）→丢弃图片。替换消息后派发roche-open-chat-request事件强制刷新UI，解决切出聊天再切回才能看到注入内容的沉浸感问题。",
+  "version": "2.2.1",
+  "description": "小红书链接注入器 v2.2.1：修复失败后无限重试循环（加 60 秒冷却 + 最多 3 次重试），处理前验证原消息是否还在数据库。",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",
