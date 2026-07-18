@@ -1,25 +1,25 @@
 /**
- * Roche 小红书链接注入器 v2.2.2
+ * Roche 小红书链接注入器 v2.3.0
  *
  * 模式一（直注模式）：原文 + 独立图片消息，10 条自动删（可开关）
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
  *                            注入：总结文本（详尽，500字左右）+ 评论 + 卡片占位符
  *
- * v2.2.2 关键改进：
- *   1. 加全局锁 isPolling，防止 setInterval 在上一次处理未完成时并发触发
- *      （自动监听总是失败的根因：300ms 间隔导致 100+ 次并发请求打爆 CORS 代理）
- *   2. 加全局浮层提示，即使插件面板关闭也能在 Roche 顶部看到状态
- *   3. 重试冷却从 60 秒改为 5 秒，最多重试 5 次
- *   4. 关键错误用系统 Notification 提醒
+ * v2.3.0 关键改进：
+ *   1. fetchXhsHtml 现在优先使用 CF Worker（之前只用公共代理，导致自动监听时被限速失败）
+ *   2. 加悬浮球：即使插件面板关闭也显示在屏幕右下角，点击快速打开面板
+ *      悬浮球有状态指示器：灰色(未监听) / 蓝色(监听中) / 黄色(处理中) / 绿色(成功) / 红色(失败)
+ *   3. fetchXhsHtml 失败时记录详细错误（每个代理的 URL/状态码/错误类型）
+ *   4. 日志面板加"复制全部日志"按钮，方便反馈问题
  *
  * 触发方式：监听消息库，用户回车后 300ms 内立即替换
- * 重要：插件 App 关闭后监听继续运行（unmount 不停止定时器）
+ * 重要：插件 App 关闭后监听继续运行（unmount 不停止定时器，悬浮球也不删除）
  */
 
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.2.2",
+  version: "2.3.0",
   apps: [
     {
       id: "xhs-reader-home",
@@ -34,11 +34,12 @@ window.RochePlugin.register({
       },
       async unmount(container, roche) {
         // 关键：不停止监听！让插件 App 关闭后继续在后台运行
-        // 只清理 UI 引用，保留定时器
+        // 只清理 UI 引用，保留定时器和悬浮球
         if (runtime.rootEl) {
           runtime.rootEl = null;
         }
         container.replaceChildren();
+        // 悬浮球不删除，继续显示在屏幕上
       }
     }
   ]
@@ -161,21 +162,52 @@ const CORS_PROXIES = [
 ];
 
 async function fetchXhsHtml(xhsUrl) {
+  // 优先使用 CF Worker（如果配置了），公共代理容易限速
+  const proxies = [];
+  try {
+    const cfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
+    if (cfWorker) {
+      proxies.push({ name: 'CF-Worker', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    }
+  } catch (e) {
+    log(`fetchXhsHtml: 读取 CF Worker 失败: ${e.message}`, 'warn');
+  }
+  proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
+  proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
+  proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
+  proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
+
   let lastErr = null;
-  for (let i = 0; i < CORS_PROXIES.length; i++) {
-    const proxyUrl = CORS_PROXIES[i](xhsUrl);
+  const errors = [];
+  for (let i = 0; i < proxies.length; i++) {
+    const proxyName = proxies[i].name;
+    const proxyUrl = proxies[i].fn(xhsUrl);
     try {
+      log(`fetchXhsHtml: [${proxyName}] 尝试: ${proxyUrl.substring(0, 80)}...`, 'info');
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
       const resp = await fetch(proxyUrl, { signal: controller.signal });
       clearTimeout(timeout);
-      if (!resp.ok) { lastErr = new Error(`HTTP ${resp.status}`); continue; }
+      if (!resp.ok) {
+        const err = `HTTP ${resp.status}`;
+        log(`fetchXhsHtml: [${proxyName}] ${err}`, 'error');
+        errors.push(`${proxyName}: ${err}`);
+        lastErr = new Error(err);
+        continue;
+      }
       const html = await resp.text();
+      log(`fetchXhsHtml: [${proxyName}] OK, ${html.length} 字节`, 'success');
       if (html && html.includes('__INITIAL_STATE__')) return html;
       lastErr = new Error('页面未包含 __INITIAL_STATE__');
-    } catch (e) { lastErr = e; continue; }
+      errors.push(`${proxyName}: 无 __INITIAL_STATE__`);
+    } catch (e) {
+      const errType = e.name === 'AbortError' ? '超时(15s)' : e.message;
+      log(`fetchXhsHtml: [${proxyName}] 异常: ${errType}`, 'error');
+      errors.push(`${proxyName}: ${errType}`);
+      lastErr = e;
+    }
   }
-  throw new Error(`所有代理均失败: ${lastErr?.message || '未知错误'}`);
+  throw new Error(`fetchXhsHtml 所有代理失败: ${errors.join(' | ')}`);
 }
 
 function parseXhsState(html) {
@@ -749,6 +781,74 @@ function showFloat(message, type = 'info', duration = 3000) {
   } catch (e) {}
 }
 
+// ============================================================
+// 悬浮球（即使插件面板关闭也显示在屏幕边缘，点击快速打开插件）
+// ============================================================
+function ensureFloatingBall() {
+  let ball = document.getElementById('xhs-floating-ball');
+  if (ball) return ball;
+  ball = document.createElement('div');
+  ball.id = 'xhs-floating-ball';
+  ball.style.cssText = `
+    position: fixed; right: 16px; bottom: 100px;
+    width: 48px; height: 48px; border-radius: 50%;
+    background: linear-gradient(135deg, #ec4899, #f43f5e);
+    color: #fff; font-size: 20px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 12px rgba(236,72,153,0.4);
+    cursor: pointer; z-index: 99998;
+    user-select: none; transition: transform 0.2s;
+    font-family: -apple-system, sans-serif;
+  `;
+  ball.textContent = '书';
+  ball.title = '小红书注入器 (点击打开面板)';
+  // 状态指示器（小圆点）
+  const dot = document.createElement('div');
+  dot.id = 'xhs-ball-dot';
+  dot.style.cssText = `
+    position: absolute; top: 0; right: 0;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: #9ca3af; border: 2px solid #fff;
+    transition: background 0.3s;
+  `;
+  ball.appendChild(dot);
+  // 点击打开插件面板
+  ball.addEventListener('click', () => {
+    try {
+      if (runtime.roche?.ui?.openApp) {
+        runtime.roche.ui.openApp('xhs-reader-home');
+      } else if (runtime.roche?.ui?.open) {
+        runtime.roche.ui.open('xhs-reader-home');
+      } else {
+        showFloat('请手动打开小红书注入器面板', 'warn', 3000);
+      }
+    } catch (e) {
+      showFloat('打开面板失败: ' + e.message, 'error', 3000);
+    }
+  });
+  document.body.appendChild(ball);
+  return ball;
+}
+
+function updateBallStatus(state, text) {
+  // state: idle | listening | processing | success | error
+  try {
+    const ball = document.getElementById('xhs-floating-ball');
+    if (!ball) return;
+    const dot = document.getElementById('xhs-ball-dot');
+    if (!dot) return;
+    const colors = {
+      idle: '#9ca3af',
+      listening: '#3b82f6',
+      processing: '#f59e0b',
+      success: '#22c55e',
+      error: '#ef4444'
+    };
+    dot.style.background = colors[state] || colors.idle;
+    if (text) ball.title = text;
+  } catch (e) {}
+}
+
 // 便捷封装：兼容面板打开/关闭两种场景
 function notify(message, type = 'info', duration = 3000) {
   // 1. 始终写日志
@@ -766,6 +866,12 @@ function notify(message, type = 'info', duration = 3000) {
     if (type === 'error' && Notification.permission === 'granted') {
       new Notification('小红书注入器', { body: message });
     }
+  } catch (e) {}
+  // 5. 更新悬浮球状态
+  try {
+    if (type === 'success') updateBallStatus('success');
+    else if (type === 'error') updateBallStatus('error');
+    else if (type === 'warn') updateBallStatus('processing');
   } catch (e) {}
 }
 
@@ -819,6 +925,7 @@ async function pollOnce() {
           // 标记正在处理
           runtime.processedLinks[key] = { processing: true, ts: now, fails: rec?.fails || 0 };
           notify(`检测到小红书链接，开始抓取...`, 'info', 2000);
+          updateBallStatus('processing', `处理中: ${url.substring(0, 30)}...`);
           try {
             notify('正在抓取小红书内容并下载图片...', 'info', 2000);
             const result = await processXhsLinkFull(url);
@@ -841,10 +948,14 @@ async function pollOnce() {
             rocheStorage.set(STORE_KEYS.processedLinks, runtime.processedLinks);
             const title = result.note.title?.substring(0, 30) || '(无标题)';
             notify(`注入成功: ${title}`, 'success', 4000);
+            updateBallStatus('success', `注入成功: ${title}`);
+            setTimeout(() => updateBallStatus(runtime.autoListen ? 'listening' : 'idle'), 3000);
             // 关键：派发刷新事件，让 Roche 重新加载会话 → UI 实时显示替换后的内容
             refreshRocheChat(convId);
           } catch (e) {
             notify(`处理失败: ${e.message}`, 'error', 5000);
+            updateBallStatus('error', `失败: ${e.message.substring(0, 30)}`);
+            setTimeout(() => updateBallStatus(runtime.autoListen ? 'listening' : 'idle'), 5000);
             // 不删除 key！保留失败计数和冷却时间
             const prevFails = runtime.processedLinks[key]?.fails || 0;
             runtime.processedLinks[key] = {
@@ -869,12 +980,14 @@ function startAutoListen() {
   if (runtime.cleanupTimer) clearInterval(runtime.cleanupTimer);
   runtime.cleanupTimer = setInterval(checkAutoDelete, runtime.cleanupInterval);
   log(`自动监听已启动 (${runtime.pollInterval}ms 间隔)`, 'info');
+  updateBallStatus('listening', '小红书注入器 (监听中)');
 }
 
 function stopAutoListen() {
   if (runtime.pollTimer) { clearInterval(runtime.pollTimer); runtime.pollTimer = null; }
   if (runtime.cleanupTimer) { clearInterval(runtime.cleanupTimer); runtime.cleanupTimer = null; }
   log('自动监听已停止', 'info');
+  updateBallStatus('idle', '小红书注入器 (未监听)');
 }
 
 // ============================================================
@@ -995,7 +1108,10 @@ async function initApp(root, roche) {
       Notification.requestPermission();
     }
   } catch (e) {}
-  log('插件已加载 v2.2.2', 'success');
+  // 创建悬浮球（即使插件面板关闭也显示在屏幕上）
+  ensureFloatingBall();
+  updateBallStatus(runtime.autoListen ? 'listening' : 'idle', runtime.autoListen ? '小红书注入器 (监听中)' : '小红书注入器 (未监听)');
+  log('插件已加载 v2.3.0', 'success');
 }
 
 function cleanup() {
@@ -1056,7 +1172,7 @@ function render(root) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="flex:1;min-width:0;">
           <h2 class="xhs-title">小红书链接注入器</h2>
-          <p class="xhs-subtitle">v2.2.2 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
+          <p class="xhs-subtitle">v2.3.0 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
         </div>
         <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
       </div>
@@ -1297,6 +1413,10 @@ $1
 
       <!-- 日志 -->
       <section class="xhs-panel" id="xhs-panel-logs">
+        <div style="display:flex;gap:6px;margin-bottom:8px;">
+          <button class="xhs-btn" id="xhs-copy-logs" style="flex:1;padding:6px 10px;font-size:12px;">复制全部日志</button>
+          <button class="xhs-btn" id="xhs-clear-logs" style="flex:0 0 auto;padding:6px 10px;font-size:12px;">清空</button>
+        </div>
         <div class="xhs-log" id="xhs-logs"></div>
       </section>
     </div>
@@ -1370,6 +1490,42 @@ function bindEvents(roche) {
     });
   }
 
+  // 复制全部日志
+  const copyLogsBtn = root.querySelector('#xhs-copy-logs');
+  if (copyLogsBtn) {
+    copyLogsBtn.addEventListener('click', async () => {
+      try {
+        const text = runtime.logs.map(l => `[${l.time}] ${l.type.toUpperCase()}: ${l.msg}`).join('\n');
+        await navigator.clipboard.writeText(text);
+        roche.ui.toast(`已复制 ${runtime.logs.length} 条日志`);
+      } catch (e) {
+        // 备用方案：创建 textarea
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = runtime.logs.map(l => `[${l.time}] ${l.type.toUpperCase()}: ${l.msg}`).join('\n');
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          ta.remove();
+          roche.ui.toast(`已复制 ${runtime.logs.length} 条日志`);
+        } catch (e2) {
+          roche.ui.toast('复制失败: ' + e2.message);
+        }
+      }
+    });
+  }
+
+  // 清空日志
+  const clearLogsBtn = root.querySelector('#xhs-clear-logs');
+  if (clearLogsBtn) {
+    clearLogsBtn.addEventListener('click', () => {
+      const n = runtime.logs.length;
+      runtime.logs = [];
+      renderLogs();
+      roche.ui.toast(`已清空 ${n} 条日志`);
+    });
+  }
+
   // Tab 切换
   root.querySelectorAll('.xhs-tab').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1393,7 +1549,7 @@ function bindEvents(roche) {
         b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
       });
       const sub = root.querySelector('.xhs-subtitle');
-      if (sub) sub.textContent = `v2.2.2 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
+      if (sub) sub.textContent = `v2.3.0 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
       roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
       log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
     });
