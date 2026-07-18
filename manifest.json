@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.2.1",
-  "description": "小红书链接注入器 v2.2.1：修复失败后无限重试循环（加 60 秒冷却 + 最多 3 次重试），处理前验证原消息是否还在数据库。",
+  "version": "2.2.2",
+  "description": "小红书链接注入器 v2.2.2：修复自动监听总是失败的根因（300ms 间隔导致100+次并发请求打爆CORS代理），加全局锁isPolling防止pollOnce并发执行。新增全局浮层提示，即使插件面板关闭也能在Roche顶部看到状态。重试冷却从60秒改为5秒，最多重试5次。关键错误用系统Notification提醒。",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",

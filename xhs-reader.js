@@ -1,13 +1,16 @@
 /**
- * Roche 小红书链接注入器 v2.2.1
+ * Roche 小红书链接注入器 v2.2.2
  *
  * 模式一（直注模式）：原文 + 独立图片消息，10 条自动删（可开关）
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
  *                            注入：总结文本（详尽，500字左右）+ 评论 + 卡片占位符
  *
- * v2.2.1 关键改进：
- *   1. 修复失败后无限重试循环：失败后 60 秒冷却，最多重试 3 次
- *   2. 处理前验证原消息是否还在数据库（避免重复处理已替换的消息）
+ * v2.2.2 关键改进：
+ *   1. 加全局锁 isPolling，防止 setInterval 在上一次处理未完成时并发触发
+ *      （自动监听总是失败的根因：300ms 间隔导致 100+ 次并发请求打爆 CORS 代理）
+ *   2. 加全局浮层提示，即使插件面板关闭也能在 Roche 顶部看到状态
+ *   3. 重试冷却从 60 秒改为 5 秒，最多重试 5 次
+ *   4. 关键错误用系统 Notification 提醒
  *
  * 触发方式：监听消息库，用户回车后 300ms 内立即替换
  * 重要：插件 App 关闭后监听继续运行（unmount 不停止定时器）
@@ -16,7 +19,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.2.1",
+  version: "2.2.2",
   apps: [
     {
       id: "xhs-reader-home",
@@ -52,6 +55,7 @@ let runtime = {
   autoListen: false,
   pollTimer: null,
   pollInterval: 300,           // 300ms 快速检测
+  isPolling: false,            // 关键：全局锁，防止 pollOnce 并发执行
   selectedIds: [],
   processedLinks: {},          // {key: {ts, convId, textMsgId, imageMsgIds, msgCountAtInject}}
   deleteAfterCount: 10,        // 10 条后自动删
@@ -694,87 +698,168 @@ function getMessageById(id) {
   }));
 }
 
+// ============================================================
+// 全局浮层提示（即使插件面板关闭也能显示在 Roche 主界面上）
+// ============================================================
+function ensureFloatLayer() {
+  let el = document.getElementById('xhs-float-layer');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'xhs-float-layer';
+    el.style.cssText = `
+      position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+      z-index: 99999; pointer-events: none;
+      display: flex; flex-direction: column; align-items: center; gap: 6px;
+      max-width: 90vw;
+    `;
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+function showFloat(message, type = 'info', duration = 3000) {
+  try {
+    const layer = ensureFloatLayer();
+    const toast = document.createElement('div');
+    const colors = {
+      info: 'background:rgba(59,130,246,0.95);color:#fff;',
+      success: 'background:rgba(34,197,94,0.95);color:#fff;',
+      error: 'background:rgba(239,68,68,0.95);color:#fff;',
+      warn: 'background:rgba(245,158,11,0.95);color:#fff;'
+    };
+    toast.style.cssText = `
+      ${colors[type] || colors.info}
+      padding: 8px 16px; border-radius: 20px; font-size: 13px; font-weight: 600;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15); max-width: 90vw;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      opacity: 0; transform: translateY(-10px);
+      transition: opacity 0.3s, transform 0.3s;
+    `;
+    toast.textContent = message;
+    layer.appendChild(toast);
+    requestAnimationFrame(() => {
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateY(0)';
+    });
+    setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(-10px)';
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+  } catch (e) {}
+}
+
+// 便捷封装：兼容面板打开/关闭两种场景
+function notify(message, type = 'info', duration = 3000) {
+  // 1. 始终写日志
+  log(message, type);
+  // 2. 始终显示顶部浮层（即使插件面板关闭也能看到）
+  showFloat(message, type, duration);
+  // 3. 面板打开时额外用 roche.ui.toast（如果可用）
+  try {
+    if (runtime.roche?.ui?.toast && runtime.rootEl) {
+      runtime.roche.ui.toast(message);
+    }
+  } catch (e) {}
+  // 4. 关键错误用系统通知
+  try {
+    if (type === 'error' && Notification.permission === 'granted') {
+      new Notification('小红书注入器', { body: message });
+    }
+  } catch (e) {}
+}
+
 async function pollOnce() {
   if (!runtime.autoListen || runtime.selectedIds.length === 0) return;
-  const now = Date.now();
-  const FAIL_COOLDOWN = 60000;   // 失败后 60 秒冷却
-  const MAX_FAILS = 3;            // 最多重试 3 次
-  for (const convId of runtime.selectedIds) {
-    try {
-      const msgs = await getMessagesByConversation(convId);
-      const recent = msgs.slice(-20);
-      for (const m of recent) {
-        if (!m.isMe) continue;
-        if (m.type !== 'text' && m.type !== undefined) continue;
-        const url = extractXhsUrl(m.text);
-        if (!url) continue;
-        const key = `${convId}_${m.id}`;
-        const rec = runtime.processedLinks[key];
-        if (rec) {
-          // 已处理成功：跳过
-          if (rec.done) continue;
-          // 正在处理中：跳过
-          if (rec.processing) continue;
-          // 失败冷却中：跳过
-          if (rec.fails > 0 && (now - (rec.lastFailTs || 0)) < FAIL_COOLDOWN) continue;
-          // 超过最大重试次数：永久跳过
-          if (rec.fails >= MAX_FAILS) {
-            if (!rec.gaveUpLogged) {
-              log(`链接已达最大重试次数 (${MAX_FAILS})，放弃: ${url.substring(0, 40)}...`, 'error');
-              rec.gaveUpLogged = true;
+  // 关键：全局锁，防止 setInterval 在上一次处理未完成时并发触发
+  // 一次抓取需要 20-30 秒，300ms 间隔会触发约 100 次，导致 CORS 代理被限流
+  if (runtime.isPolling) return;
+  runtime.isPolling = true;
+  try {
+    const now = Date.now();
+    const FAIL_COOLDOWN = 5000;   // 失败后 5 秒冷却（用户要求）
+    const MAX_FAILS = 5;            // 最多重试 5 次
+    for (const convId of runtime.selectedIds) {
+      try {
+        const msgs = await getMessagesByConversation(convId);
+        const recent = msgs.slice(-20);
+        for (const m of recent) {
+          if (!m.isMe) continue;
+          if (m.type !== 'text' && m.type !== undefined) continue;
+          const url = extractXhsUrl(m.text);
+          if (!url) continue;
+          const key = `${convId}_${m.id}`;
+          const rec = runtime.processedLinks[key];
+          if (rec) {
+            // 已处理成功：跳过
+            if (rec.done) continue;
+            // 正在处理中：跳过
+            if (rec.processing) continue;
+            // 失败冷却中：跳过
+            if (rec.fails > 0 && (now - (rec.lastFailTs || 0)) < FAIL_COOLDOWN) continue;
+            // 超过最大重试次数：永久跳过
+            if (rec.fails >= MAX_FAILS) {
+              if (!rec.gaveUpLogged) {
+                notify(`链接已达最大重试次数 (${MAX_FAILS})，放弃: ${url.substring(0, 40)}...`, 'error', 5000);
+                rec.gaveUpLogged = true;
+              }
+              continue;
             }
+            // 进入重试
+            notify(`重试处理 (第 ${rec.fails + 1}/${MAX_FAILS} 次): ${url.substring(0, 40)}...`, 'warn');
+          }
+          // 关键：处理前先验证原消息是否还在数据库
+          // （如果上一轮已经成功替换但没来得及记录，原消息已被删除，就不需要再处理）
+          const stillExists = await getMessageById(m.id);
+          if (!stillExists) {
+            runtime.processedLinks[key] = { done: true, ts: now, note: '原消息已被替换' };
+            rocheStorage.set(STORE_KEYS.processedLinks, runtime.processedLinks);
             continue;
           }
-          // 进入重试
-          log(`重试处理 (第 ${rec.fails + 1}/${MAX_FAILS} 次): ${url.substring(0, 40)}...`, 'info');
-        }
-        // 关键：处理前先验证原消息是否还在数据库
-        // （如果上一轮已经成功替换但没来得及记录，原消息已被删除，就不需要再处理）
-        const stillExists = await getMessageById(m.id);
-        if (!stillExists) {
-          runtime.processedLinks[key] = { done: true, ts: now, note: '原消息已被替换' };
-          rocheStorage.set(STORE_KEYS.processedLinks, runtime.processedLinks);
-          continue;
-        }
-        // 标记正在处理
-        runtime.processedLinks[key] = { processing: true, ts: now, fails: rec?.fails || 0 };
-        log(`检测到小红书链接: ${url.substring(0, 50)}...`, 'info');
-        try {
-          const result = await processXhsLinkFull(url);
-          let procResult;
-          if (runtime.mode === 2) {
-            procResult = await processMode2(m, url, result);
-          } else {
-            procResult = await processMode1(m, url, result);
+          // 标记正在处理
+          runtime.processedLinks[key] = { processing: true, ts: now, fails: rec?.fails || 0 };
+          notify(`检测到小红书链接，开始抓取...`, 'info', 2000);
+          try {
+            notify('正在抓取小红书内容并下载图片...', 'info', 2000);
+            const result = await processXhsLinkFull(url);
+            let procResult;
+            if (runtime.mode === 2) {
+              procResult = await processMode2(m, url, result);
+            } else {
+              procResult = await processMode1(m, url, result);
+            }
+            runtime.processedLinks[key] = {
+              done: true,
+              ts: Date.now(),
+              injectTs: m.timestamp || Date.now(),
+              convId,
+              textMsgId: procResult.textMsgId,
+              imageMsgIds: procResult.imageMsgIds,
+              mode: runtime.mode,
+              deleted: false
+            };
+            rocheStorage.set(STORE_KEYS.processedLinks, runtime.processedLinks);
+            const title = result.note.title?.substring(0, 30) || '(无标题)';
+            notify(`注入成功: ${title}`, 'success', 4000);
+            // 关键：派发刷新事件，让 Roche 重新加载会话 → UI 实时显示替换后的内容
+            refreshRocheChat(convId);
+          } catch (e) {
+            notify(`处理失败: ${e.message}`, 'error', 5000);
+            // 不删除 key！保留失败计数和冷却时间
+            const prevFails = runtime.processedLinks[key]?.fails || 0;
+            runtime.processedLinks[key] = {
+              fails: prevFails + 1,
+              lastFailTs: Date.now(),
+              ts: Date.now()
+            };
+            rocheStorage.set(STORE_KEYS.processedLinks, runtime.processedLinks);
+            notify(`将在 ${FAIL_COOLDOWN / 1000} 秒后重试 (已失败 ${prevFails + 1}/${MAX_FAILS})`, 'warn', 3000);
           }
-          runtime.processedLinks[key] = {
-            done: true,
-            ts: Date.now(),
-            injectTs: m.timestamp || Date.now(),
-            convId,
-            textMsgId: procResult.textMsgId,
-            imageMsgIds: procResult.imageMsgIds,
-            mode: runtime.mode,
-            deleted: false
-          };
-          rocheStorage.set(STORE_KEYS.processedLinks, runtime.processedLinks);
-          log(`处理成功 (模式${runtime.mode}) 标题: ${result.note.title?.substring(0, 30) || '(无标题)'} (图片 ${procResult.imgOk}/${procResult.imgOk + procResult.imgFail})`, 'success');
-          // 关键：派发刷新事件，让 Roche 重新加载会话 → UI 实时显示替换后的内容
-          refreshRocheChat(convId);
-        } catch (e) {
-          log(`处理失败: ${e.message}`, 'error');
-          // 不删除 key！保留失败计数和冷却时间
-          const prevFails = runtime.processedLinks[key]?.fails || 0;
-          runtime.processedLinks[key] = {
-            fails: prevFails + 1,
-            lastFailTs: Date.now(),
-            ts: Date.now()
-          };
-          rocheStorage.set(STORE_KEYS.processedLinks, runtime.processedLinks);
-          log(`将在 ${FAIL_COOLDOWN / 1000} 秒后重试 (已失败 ${prevFails + 1}/${MAX_FAILS})`, 'info');
         }
-      }
-    } catch (e) {}
+      } catch (e) {}
+    }
+  } finally {
+    runtime.isPolling = false;
   }
 }
 
@@ -904,7 +989,13 @@ async function initApp(root, roche) {
   } else if (wasListening) {
     log(`检测到监听已在运行（无需重启定时器）`, 'info');
   }
-  log('插件已加载 v2.2.1', 'success');
+  // 请求系统通知权限（用于面板关闭时的关键错误提醒）
+  try {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  } catch (e) {}
+  log('插件已加载 v2.2.2', 'success');
 }
 
 function cleanup() {
@@ -965,7 +1056,7 @@ function render(root) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="flex:1;min-width:0;">
           <h2 class="xhs-title">小红书链接注入器</h2>
-          <p class="xhs-subtitle">v2.2.1 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
+          <p class="xhs-subtitle">v2.2.2 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
         </div>
         <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
       </div>
@@ -1302,7 +1393,7 @@ function bindEvents(roche) {
         b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
       });
       const sub = root.querySelector('.xhs-subtitle');
-      if (sub) sub.textContent = `v2.2.1 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
+      if (sub) sub.textContent = `v2.2.2 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
       roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
       log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
     });
