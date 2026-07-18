@@ -1,9 +1,14 @@
 /**
- * Roche 小红书链接注入器 v2.1.0
+ * Roche 小红书链接注入器 v2.2.0
  *
  * 模式一（直注模式）：原文 + 独立图片消息，10 条自动删（可开关）
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
- *                            注入：总结文本 + 评论 + 卡片占位符
+ *                            注入：总结文本（详尽，500字左右）+ 评论 + 卡片占位符
+ *
+ * v2.2 关键改进：
+ *   1. 替换消息后派发 roche-open-chat-request 事件，强制 Roche 重新加载会话
+ *      → 解决"切出聊天再切回才能看到注入内容"的沉浸感问题
+ *   2. 总结提示词加强：详尽保留关键信息，不省略专有名词/数字/步骤，500-800 字
  *
  * 触发方式：监听消息库，用户回车后 300ms 内立即替换
  * 重要：插件 App 关闭后监听继续运行（unmount 不停止定时器）
@@ -12,7 +17,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.1.0",
+  version: "2.2.0",
   apps: [
     {
       id: "xhs-reader-home",
@@ -318,6 +323,29 @@ async function getSharerName() {
 }
 
 // ============================================================
+// 强制刷新 Roche 聊天界面（核心 hack）
+// ============================================================
+// Roche 用 Vue 3 reactive 追踪 store[conversationId] 数组
+// 外部直接改 IndexedDB 不会触发重渲染
+// 通过派发 roche-open-chat-request 事件，让 Roche 重新挂载 Chat 组件并重新加载消息
+function refreshRocheChat(conversationId) {
+  try {
+    if (!conversationId) return;
+    // 派发 Roche 内置事件：触发主应用打开该会话 → Chat 组件挂载 → 重新读取消息
+    window.dispatchEvent(new CustomEvent('roche-open-chat-request', {
+      detail: {
+        conversationId: String(conversationId),
+        pushType: '',
+        source: 'xhs-reader-plugin'
+      }
+    }));
+    log(`已派发刷新事件到会话 ${conversationId}`, 'info');
+  } catch (e) {
+    log(`刷新 Roche UI 失败: ${e.message}`, 'error');
+  }
+}
+
+// ============================================================
 // 消息注入辅助
 // ============================================================
 function genMsgId() {
@@ -470,7 +498,7 @@ async function callSubApi(systemPrompt, userPrompt, imageUrls) {
       { role: 'user', content: userContent }
     ],
     temperature: preset.temperature ?? 0.5,
-    max_tokens: 1000
+    max_tokens: 2000  // 详尽总结需要更多 token
   };
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60000);  // vision 请求给 60 秒
@@ -503,15 +531,21 @@ async function summarizeNote(note, comments, imageDataUrls) {
   const commentsText = formatCommentsText(comments);
   const tags = extractTags(note).join('、');
 
-  // 系统提示：允许保留值得记录的原文
-  const systemPrompt = `你是一个小红书笔记总结助手。请基于提供的笔记正文、图片和评论，生成一份 300 字左右的中文总结。
+  // 系统提示：详尽总结，保留所有关键信息
+  const systemPrompt = `你是一个小红书笔记总结助手。请基于提供的笔记正文、图片和评论，生成一份详尽的中文总结。
 
 要求：
-1. 保留关键信息（地点、价格、步骤、推荐、产品名、地点名等）
-2. 允许把值得记录的原文句子（如具体价格、关键步骤、金句）原样放入总结
-3. 图片里的信息也要纳入总结
-4. 不要添加评论或主观评价
-5. 控制在 300 字左右，不要超过 400 字`;
+1. 保留所有关键信息，不要省略：
+   - 地点、地址、店名、产品名、人名等专有名词
+   - 价格、数量、规格、时长等数字信息
+   - 步骤、方法、注意事项等流程信息
+   - 时间、日期、营业时段等时效信息
+2. 允许把值得记录的原文句子（如具体价格、关键步骤、金句、推荐语）原样放入总结
+3. 图片里的信息也要详细纳入总结（图片上的文字、价格、菜单、地址等）
+4. 评论中有价值的补充信息（如追问、纠错、补充推荐）也要纳入
+5. 不要主观评价，只做客观归纳
+6. 控制在 500 字左右，可以更多，但不要超过 800 字
+7. 按逻辑分点组织，让 char 能完整理解笔记内容`;
 
   const userPrompt = `标题：${title}
 标签：${tags}
@@ -522,22 +556,22 @@ ${desc}
 评论：
 ${commentsText}
 
-请总结这篇笔记（包括图片中的信息）。`;
+请详尽总结这篇笔记（包括图片中的所有可见信息），不要省略关键内容，让没看过的人能完全理解这篇笔记在讲什么。`;
 
   // 如果有图片，必须调用副 API 让 vision 模型看图
   if (imageDataUrls && imageDataUrls.length > 0) {
-    log(`准备发送 ${imageDataUrls.length} 张图片给副 API 总结`, 'info');
+    log(`准备发送 ${imageDataUrls.length} 张图片给副 API 详尽总结`, 'info');
     const summary = await callSubApi(systemPrompt, userPrompt, imageDataUrls);
     log(`副 API 总结完成（含图片识别），长度 ${summary.length}`, 'success');
     return summary;
   }
 
-  // 没图片：≤300 字原样，>300 字调 API 总结
-  if (desc.length <= 300) {
-    log(`无图片且正文 ${desc.length} 字 ≤300，原样输出`, 'info');
+  // 没图片：≤500 字原样，>500 字调 API 总结
+  if (desc.length <= 500) {
+    log(`无图片且正文 ${desc.length} 字 ≤500，原样输出`, 'info');
     return desc;
   }
-  log(`无图片且正文 ${desc.length} 字 >300，调用副 API 总结`, 'info');
+  log(`无图片且正文 ${desc.length} 字 >500，调用副 API 详尽总结`, 'info');
   const summary = await callSubApi(systemPrompt, userPrompt, null);
   log(`副 API 总结完成，长度 ${summary.length}`, 'success');
   return summary;
@@ -688,6 +722,8 @@ async function pollOnce() {
           };
           rocheStorage.set(STORE_KEYS.processedLinks, runtime.processedLinks);
           log(`处理成功 (模式${runtime.mode}) 标题: ${result.note.title?.substring(0, 30) || '(无标题)'} (图片 ${procResult.imgOk}/${procResult.imgOk + procResult.imgFail})`, 'success');
+          // 关键：派发刷新事件，让 Roche 重新加载会话 → UI 实时显示替换后的内容
+          refreshRocheChat(convId);
         } catch (e) {
           log(`处理失败: ${e.message}`, 'error');
           delete runtime.processedLinks[key];
@@ -823,7 +859,7 @@ async function initApp(root, roche) {
   } else if (wasListening) {
     log(`检测到监听已在运行（无需重启定时器）`, 'info');
   }
-  log('插件已加载 v2.1.0', 'success');
+  log('插件已加载 v2.2.0', 'success');
 }
 
 function cleanup() {
@@ -884,7 +920,7 @@ function render(root) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="flex:1;min-width:0;">
           <h2 class="xhs-title">小红书链接注入器</h2>
-          <p class="xhs-subtitle">v2.1.0 · 模式${runtime.mode === 2 ? '二：副 API 总结' : '一：直注模式'}</p>
+          <p class="xhs-subtitle">v2.2.0 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
         </div>
         <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
       </div>
@@ -1221,7 +1257,7 @@ function bindEvents(roche) {
         b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
       });
       const sub = root.querySelector('.xhs-subtitle');
-      if (sub) sub.textContent = `v2.1.0 · 模式${mode === 2 ? '二：副 API 总结' : '一：直注模式'}`;
+      if (sub) sub.textContent = `v2.2.0 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
       roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
       log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
     });
@@ -1348,6 +1384,8 @@ function bindEvents(roche) {
       }
       roche.ui.toast(`注入成功（图片 ${procResult.imgOk}/${procResult.imgOk + procResult.imgFail}）`);
       log(`手动注入成功到 ${convId} (图片 ${procResult.imgOk}/${procResult.imgOk + procResult.imgFail})`, 'success');
+      // 关键：派发刷新事件，让 Roche 重新加载会话 → UI 实时显示替换后的内容
+      refreshRocheChat(convId);
     } catch (e) {
       roche.ui.toast('注入失败: ' + e.message);
       log(`手动注入失败: ${e.message}`, 'error');
