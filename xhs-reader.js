@@ -34,16 +34,7 @@ window.RochePlugin.register({
         await initApp(root, roche);
       },
       async unmount(container, roche) {
-        // 关键：关闭插件时停止监听（每次启动插件都需要用户手动开启监听）
-        if (runtime.pollTimer) {
-          clearInterval(runtime.pollTimer);
-          runtime.pollTimer = null;
-        }
-        if (runtime.cleanupTimer) {
-          clearInterval(runtime.cleanupTimer);
-          runtime.cleanupTimer = null;
-        }
-        runtime.autoListen = false;
+        // 关闭面板时保留监听，监听继续在后台运行
         if (runtime.rootEl) {
           runtime.rootEl = null;
         }
@@ -173,12 +164,11 @@ const CORS_PROXIES = [
 async function fetchXhsHtml(xhsUrl) {
   // 注意：CF Worker 不适合抓 HTML 页面（它带了图片专用 Accept 头，会被小红书拒绝）
   // CF Worker 只用于下载图片。HTML 抓取只用公共代理。
-  // 按用户要求：前两个代理（allorigins, corsproxy）总是失败，跳过，从 codetabs 开始
   const proxies = [
+    { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
     { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
     { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
-    { name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
-    { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` }
+    { name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` }
   ];
 
   let lastErr = null;
@@ -755,19 +745,16 @@ async function checkAutoDelete() {
 // ============================================================
 function extractXhsUrl(text) {
   if (!text) return null;
-  // 用 trim 后第一个空白分隔符切分，取第一个匹配的 token
-  // 避免正则贪婪/非贪婪问题导致 URL 被截断
-  const tokens = text.trim().split(/\s+/);
-  for (const t of tokens) {
-    // 清理可能的标点尾随（中文逗号、句号、感叹号等）
-    const clean = t.replace(/[,。！？；，、]+$/, '');
-    if (/^https?:\/\/(www\.xiaohongshu\.com|xhslink\.com)/.test(clean)) {
-      return clean;
-    }
+  // 从混合文本中匹配完整的小红书链接，支持：
+  //   - 反引号/括号/引号包裹的链接
+  //   - 多段路径（xhslink.com/o/xxx）
+  //   - 各种小红书 URL 格式
+  // 遇到空白、中文标点、闭合括号、CJK 字符等结束
+  const m = text.match(/https?:\/\/(?:xhslink\.com\/[^\s`'"（()）,。！？；、）)\]》\u4e00-\u9fa5]+|www\.xiaohongshu\.com\/[^\s`'"（()）,。！？；、）)\]》\u4e00-\u9fa5]+)/);
+  if (m) {
+    return m[0].replace(/[,。！？；，、]+$/, '').trim();
   }
-  // 兜底：原始正则
-  const m = text.match(/https?:\/\/(?:www\.xiaohongshu\.com\/(?:discovery\/item\/|explore\/|note\/)?[a-zA-Z0-9]+|xhslink\.com\/[a-zA-Z0-9]+)/);
-  return m ? m[0] : null;
+  return null;
 }
 
 function getMessageById(id) {
@@ -1143,11 +1130,8 @@ async function initApp(root, roche) {
   runtime.mode = mode || 1;
   runtime.selectedIds = sel || [];
   runtime.processedLinks = proc || {};
-  // 关键：每次启动插件都不自动开启监听，必须用户手动打开
-  // （即使上次保存了 autoListen=true，也不自动恢复）
-  runtime.autoListen = false;
-  // 持久化的 autoListen 值只用于显示 UI 状态，不真正启动监听
-  // 实际启动由用户在 UI 上点击开关触发
+  // 恢复上次的 autoListen 状态（用于面板 loading 时同步 UI）
+  runtime.autoListen = auto === true;
   runtime.deleteAfterCount = deleteAfter || 10;
   runtime.deleteTextEnabled = delText !== false;
   runtime.deleteImagesEnabled = delImgs !== false;
@@ -1157,17 +1141,15 @@ async function initApp(root, roche) {
   render(root);
   bindEvents(roche);
 
-  // 关键：不自动启动监听！必须用户手动开启
-  // 如果之前的 pollTimer 还在（插件 App 关闭又打开），停止它
-  if (runtime.pollTimer) {
-    clearInterval(runtime.pollTimer);
-    runtime.pollTimer = null;
+  // 如果之前开启了监听且勾选了会话，自动启动
+  if (runtime.autoListen && runtime.selectedIds.length > 0) {
+    startAutoListen();
   }
-  // 同步 UI 开关状态为关闭
+  // 同步 UI 开关状态
   const autoToggle = root.querySelector('#xhs-auto-toggle');
-  if (autoToggle) autoToggle.checked = false;
+  if (autoToggle) autoToggle.checked = runtime.autoListen;
   const status = root.querySelector('#xhs-listen-status');
-  if (status) status.textContent = '已停止';
+  if (status) status.textContent = runtime.autoListen && runtime.selectedIds.length > 0 ? '运行中' : '已停止';
   // 请求系统通知权限（用于面板关闭时的关键错误提醒）
   try {
     if ('Notification' in window && Notification.permission === 'default') {
@@ -1652,7 +1634,13 @@ function bindEvents(roche) {
     const id = item.dataset.id;
     const idx = runtime.selectedIds.indexOf(id);
     if (idx >= 0) runtime.selectedIds.splice(idx, 1);
-    else runtime.selectedIds.push(id);
+    else {
+      if (runtime.selectedIds.length >= 3) {
+        roche.ui.toast('最多监听 3 个会话');
+        return;
+      }
+      runtime.selectedIds.push(id);
+    }
     await rocheStorage.set(STORE_KEYS.selectedIds, runtime.selectedIds);
     renderConversationList();
     const status = root.querySelector('#xhs-listen-status');
