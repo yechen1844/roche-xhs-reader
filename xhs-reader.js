@@ -874,6 +874,11 @@ function render(root) {
       .xhs-row { display:flex; gap:8px; align-items:center; }
       .xhs-row > * { flex:1; }
       .xhs-status { padding:6px 10px; border-radius:4px; font-size:12px; background:var(--xhs-bg-soft); }
+      .xhs-regex-block { border:1px solid var(--xhs-border); border-radius:8px; padding:10px; background:#fafafa; margin-top:4px; }
+      .xhs-regex-label { font-size:12px; font-weight:600; color:var(--xhs-text-dim); margin:6px 0 4px 0; }
+      .xhs-regex-label:first-child { margin-top:0; }
+      .xhs-regex-code { width:100%; padding:8px 10px; border:1px solid var(--xhs-border); border-radius:4px; font-family:'Consolas','Monaco',monospace; font-size:11px; line-height:1.5; background:#fff; color:#1f2937; resize:vertical; box-sizing:border-box; }
+      .xhs-regex-code:focus { outline:none; border-color:var(--xhs-accent); }
     </style>
     <div class="xhs-header">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
@@ -1018,24 +1023,32 @@ function render(root) {
       <!-- 正则文案 -->
       <section class="xhs-panel" id="xhs-panel-regex">
         <div class="xhs-hint" style="margin-bottom:12px;padding:10px;background:#fff3cd;border-radius:6px;color:#856404;">
-          把以下两段正则配置复制到 Roche 的「正则替换」设置里，即可让模式二的消息渲染成精美卡片，同时把 AI 上下文隐藏起来。
+          把以下三段正则配置复制到 Roche 的「正则替换」设置里，即可让模式二的消息渲染成精美卡片，同时把 AI 上下文（笔记总结/评论标签）隐藏起来。
         </div>
+
         <div class="xhs-field">
-          <label class="xhs-label">正则 1：渲染 XHS_CARD 为卡片（user 可见）</label>
-          <textarea class="xhs-input" readonly rows="8" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">匹配：[XHS_CARD]([\\s\\S]*?)[/XHS_CARD]
-替换：
-<div style="margin:8px 0;padding:12px;border-radius:12px;background:linear-gradient(135deg,#fff,#fdf2f8);border:1px solid #fce7f3;box-shadow:0 2px 8px rgba(236,72,153,0.1);">
+          <label class="xhs-label">正则 1：渲染 XHS_CARD 为卡片容器</label>
+          <div class="xhs-hint" style="margin-bottom:6px;">把 [XHS_CARD]...[/XHS_CARD] 包成粉色渐变卡片容器（user 可见，char 看到的是简短标记）。</div>
+          <div class="xhs-regex-block">
+            <div class="xhs-regex-label">匹配：</div>
+            <textarea class="xhs-regex-code" readonly rows="2" onclick="this.select()">[XHS_CARD]([\s\S]*?)[/XHS_CARD]</textarea>
+            <div class="xhs-regex-label">替换：</div>
+            <textarea class="xhs-regex-code" readonly rows="6" onclick="this.select()">&lt;div style="margin:8px 0;padding:12px;border-radius:12px;background:linear-gradient(135deg,#fff,#fdf2f8);border:1px solid #fce7f3;box-shadow:0 2px 8px rgba(236,72,153,0.1);"&gt;
 $1
-</div></textarea>
-          <div class="xhs-hint" style="margin-top:4px;">此正则会把 [XHS_CARD]...[/XHS_CARD] 包成卡片容器，你可以进一步自定义内部样式。</div>
+&lt;/div&gt;</textarea>
+          </div>
         </div>
+
         <div class="xhs-field">
-          <label class="xhs-label">正则 2：把卡片内容渲染为可读格式</label>
-          <textarea class="xhs-input" readonly rows="12" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">匹配：title=(.*?)\\nimages=(.*?)\\npreview=(.*?)\\ntags=(.*?)(?=\\n|$)
-替换：
-<div style="font-weight:600;font-size:15px;margin-bottom:8px;">$1</div>
-<div id="xhs-imgs-$1" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;"></div>
-<script>
+          <label class="xhs-label">正则 2：把卡片内的字段渲染为标题+图片+预览+标签</label>
+          <div class="xhs-hint" style="margin-bottom:6px;">把 title= / images= / preview= / tags= 四行转成可视化布局，自动加载笔记图片。</div>
+          <div class="xhs-regex-block">
+            <div class="xhs-regex-label">匹配：</div>
+            <textarea class="xhs-regex-code" readonly rows="2" onclick="this.select()">title=(.*?)\nimages=(.*?)\npreview=(.*?)\ntags=(.*?)(?=\n|$)</textarea>
+            <div class="xhs-regex-label">替换：</div>
+            <textarea class="xhs-regex-code" readonly rows="14" onclick="this.select()">&lt;div style="font-weight:600;font-size:15px;margin-bottom:8px;"&gt;$1&lt;/div&gt;
+&lt;div id="xhs-imgs-$1" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;"&gt;&lt;/div&gt;
+&lt;script&gt;
 (function(){
   var imgs='$2'.split(',');
   var box=document.querySelector('#xhs-imgs-$1');
@@ -1047,15 +1060,30 @@ $1
     box.appendChild(img);
   });
 })();
-</script>
-<div style="font-size:13px;color:#666;margin:8px 0;">$3</div>
-<div style="font-size:12px;color:#ec4899;">$4</div></textarea>
+&lt;/script&gt;
+&lt;div style="font-size:13px;color:#666;margin:8px 0;"&gt;$3&lt;/div&gt;
+&lt;div style="font-size:12px;color:#ec4899;"&gt;$4&lt;/div&gt;</textarea>
+          </div>
         </div>
+
         <div class="xhs-field">
-          <label class="xhs-label">正则 3：隐藏 [笔记总结] 和 [用户评论] 标签</label>
-          <textarea class="xhs-input" readonly rows="4" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">匹配：\\[(笔记总结|用户评论|/笔记总结|/用户评论)\\]
-替换：（留空）</textarea>
-          <div class="xhs-hint" style="margin-top:4px;">这样 char 看到的是纯文本段落，user 也不看到奇怪的方括号标签。</div>
+          <label class="xhs-label">正则 3：隐藏 [笔记总结] / [用户评论] 标签</label>
+          <div class="xhs-hint" style="margin-bottom:6px;">把这些方括号标签从渲染中移除（user 不看到奇怪标签，char 看到的是纯文本段落）。</div>
+          <div class="xhs-regex-block">
+            <div class="xhs-regex-label">匹配：</div>
+            <textarea class="xhs-regex-code" readonly rows="2" onclick="this.select()">\[(笔记总结|用户评论|/笔记总结|/用户评论)\]</textarea>
+            <div class="xhs-regex-label">替换：</div>
+            <textarea class="xhs-regex-code" readonly rows="1" onclick="this.select()">（留空）</textarea>
+          </div>
+        </div>
+
+        <div class="xhs-field">
+          <label class="xhs-label">最终效果</label>
+          <div class="xhs-hint" style="padding:10px;background:var(--xhs-bg-soft);border-radius:6px;line-height:1.7;">
+            <strong>user 视角：</strong>看到一张粉色渐变卡片，里面有标题、缩略图、笔记预览、标签<br/>
+            <strong>char 视角：</strong>看到「xxx分享了一个小红书笔记：」+ 标题 + 总结文本（300 字左右）+ 评论，不会看到乱码或图片 URL<br/>
+            <strong>token 节省：</strong>相比模式一直接注入全文+图片，模式二只占约 400 字
+          </div>
         </div>
       </section>
 
