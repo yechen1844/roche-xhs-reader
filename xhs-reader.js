@@ -365,36 +365,48 @@ function refreshRocheChat(conversationId) {
   try {
     if (!conversationId) return;
     const cid = String(conversationId);
-    // 多种刷新方式组合使用，最大化保证 UI 实时更新
 
-    // 方式 1：派发 Roche 内置事件（如果存在）
+    // Roche 用 Vue 3 reactive 追踪内存中的 store[conversationId] 数组
+    // 外部直接改 IndexedDB 不会触发重渲染
+    // 通过延时级联派发事件，让 Roche 重新挂载 Chat 组件并重新加载消息
+
+    // 立即发：roche-open-chat-request（触发组件重挂载）
     try {
       window.dispatchEvent(new CustomEvent('roche-open-chat-request', {
-        detail: {
-          conversationId: cid,
-          pushType: '',
-          source: 'xhs-reader-plugin'
-        }
+        detail: { conversationId: cid, pushType: '', source: 'xhs-reader-plugin' }
       }));
     } catch (e) {}
 
-    // 方式 2：派发 storage 事件触发 Roche reactive 系统
-    try {
-      window.dispatchEvent(new CustomEvent('roche-messages-updated', {
-        detail: { conversationId: cid, source: 'xhs-reader-plugin' }
-      }));
-    } catch (e) {}
+    // 50ms 后：roche-messages-updated（触发 store 重新读取）
+    setTimeout(() => {
+      try {
+        window.dispatchEvent(new CustomEvent('roche-messages-updated', {
+          detail: { conversationId: cid, source: 'xhs-reader-plugin' }
+        }));
+      } catch (e) {}
+    }, 50);
 
-    // 方式 3：直接派发通用的消息更新事件
-    try {
-      window.dispatchEvent(new CustomEvent('messages-updated', {
-        detail: { conversationId: cid }
-      }));
-    } catch (e) {}
+    // 150ms 后：通用 messages-updated（兜底事件）
+    setTimeout(() => {
+      try {
+        window.dispatchEvent(new CustomEvent('messages-updated', {
+          detail: { conversationId: cid }
+        }));
+      } catch (e) {}
+    }, 150);
 
-    log(`已派发刷新事件到会话 ${cid}`, 'info');
+    // 300ms 后：再发一次 roche-open-chat-request，确保重挂载
+    setTimeout(() => {
+      try {
+        window.dispatchEvent(new CustomEvent('roche-open-chat-request', {
+          detail: { conversationId: cid, pushType: '', source: 'xhs-reader-plugin' }
+        }));
+      } catch (e) {}
+    }, 300);
+
+    log(`refreshRocheChat: 已派发级联刷新事件到会话 ${cid}`, 'info');
   } catch (e) {
-    log(`刷新 Roche UI 失败: ${e.message}`, 'error');
+    log(`refreshRocheChat 失败: ${e.message}`, 'error');
   }
 }
 
