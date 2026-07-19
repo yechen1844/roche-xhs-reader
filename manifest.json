@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.6.0",
-  "description": "小红书链接注入器 v2.6.0：内置官方 CF Worker 代理，浏览器端开箱即用（默认开启，解决 corsproxy 403 问题）。处理数据仅限小红书公开笔记链接/HTML/图片，不经过用户隐私数据。APK 端保持 corsproxy 优先原逻辑。可关闭内置代理或填自己的 CF Worker 地址。",
+  "version": "2.6.1",
+  "description": "小红书链接注入器 v2.6.1：内置官方 CF Worker 代理 (xhs-proxy.luyi90720.workers.dev)，浏览器端开箱即用。处理数据仅限小红书公开笔记链接/HTML/图片，不经过用户隐私数据。APK 端保持 corsproxy 优先原逻辑。",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",

@@ -1,0 +1,4 @@
+check-cf.mjs
+deploy-cf.mjs
+*-cf.mjs
+*.local.mjs

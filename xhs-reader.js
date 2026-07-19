@@ -1,5 +1,5 @@
 /**
- * Roche 小红书链接注入器 v2.6.0
+ * Roche 小红书链接注入器 v2.6.1
  *
  * 模式一（直注模式）：原文 + 独立图片消息
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
@@ -25,7 +25,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.6.0",
+  version: "2.6.1",
   apps: [
     {
       id: "xhs-reader-home",
@@ -52,7 +52,7 @@ window.RochePlugin.register({
 // ============================================================
 // 常量
 // ============================================================
-const BUILTIN_CF_WORKER = 'https://xhs-proxy.1844316589.workers.dev';
+const BUILTIN_CF_WORKER = 'https://xhs-proxy.luyi90720.workers.dev';
 
 // ============================================================
 // 状态
@@ -1437,7 +1437,7 @@ async function initApp(root, roche) {
   const ball = document.getElementById('xhs-floating-ball');
   if (ball) ball.style.display = 'none';
   updateBallStatus(runtime.autoListen ? 'listening' : 'idle', runtime.autoListen ? '小红书注入器 (监听中)' : '小红书注入器 (未监听)');
-  log('插件已加载 v2.6.0', 'success');
+  log('插件已加载 v2.6.1', 'success');
 }
 
 function cleanup() {
@@ -1498,7 +1498,7 @@ function render(root) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="flex:1;min-width:0;">
           <h2 class="xhs-title">小红书链接注入器</h2>
-          <p class="xhs-subtitle">v2.6.0 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
+          <p class="xhs-subtitle">v2.6.1 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
         </div>
         <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
       </div>
@@ -1916,7 +1916,7 @@ function bindEvents(roche) {
         b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
       });
       const sub = root.querySelector('.xhs-subtitle');
-      if (sub) sub.textContent = `v2.6.0 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
+      if (sub) sub.textContent = `v2.6.1 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
       roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
       log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
     });
