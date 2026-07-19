@@ -1,20 +1,21 @@
 /**
- * Roche 小红书链接注入器 v2.5.1
+ * Roche 小红书链接注入器 v2.6.0
  *
  * 模式一（直注模式）：原文 + 独立图片消息
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
  *                            注入：总结文本（详尽，500字左右）+ 评论 + 卡片占位符
  *
- * v2.5.1 关键改进（解决浏览器 corsproxy 403 问题）：
- *   1. CF Worker 通用化 - 同时处理 HTML 和图片（用户配置后 HTML 也走 CF Worker）
- *   2. corsproxy.io 免费版仅允许 localhost/GitHub.io 等 Origin 白名单
- *      浏览器从非 localhost 打开 HTML 时 corsproxy 必然返回 403（无法绕过）
- *      APK WebView 不发 Origin → corsproxy 放行（这就是 APK 能用的原因）
- *   3. 智能代理选择：CF Worker > allorigins-json > codetabs > thingproxy > corsproxy
- *   4. smartFetch 添加 referrerPolicy: 'no-referrer' 绕过部分代理 Referer 检查
- *   5. 日志明确提示 corsproxy 403 原因，建议配置 CF Worker
+ * v2.6.0 关键改进（内置 CF Worker 代理，开箱即用）：
+ *   1. 内置官方 CF Worker 代理（默认开启，浏览器端优先使用）
+ *      - 地址：https://xhs-proxy.1844316589.workers.dev
+ *      - 处理的数据仅限：小红书笔记链接、笔记HTML、小红书图片（全部公开数据）
+ *      - 不经过用户隐私数据（聊天内容、角色人设、API Key 均不经过此代理）
+ *      - 不放心可以自己部署 CF Worker，或关闭内置代理改用公共代理
+ *   2. APK 端保持原逻辑：corsproxy 优先，CF Worker 仅用于图片下载
+ *   3. 浏览器端：内置 CF Worker 优先（HTML+图片）→ 公共代理降级
+ *   4. 设置面板新增开关：一键开启/关闭内置代理
  *
- * v2.5.0 特性保留：isApkWebView() / smartFetch() CORS 拦截识别
+ * v2.5.x 特性保留：isApkWebView() / smartFetch() CORS 拦截识别 / CF Worker 通用化
  * v2.4.x 特性保留：关闭面板不停监听 / autoListen 恢复 / 会话上限 3 个
  *
  * 触发方式：监听消息库，用户回车后 2s 内立即替换
@@ -24,7 +25,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.5.1",
+  version: "2.6.0",
   apps: [
     {
       id: "xhs-reader-home",
@@ -49,6 +50,11 @@ window.RochePlugin.register({
 });
 
 // ============================================================
+// 常量
+// ============================================================
+const BUILTIN_CF_WORKER = 'https://xhs-proxy.1844316589.workers.dev';
+
+// ============================================================
 // 状态
 // ============================================================
 let runtime = {
@@ -57,6 +63,7 @@ let runtime = {
   rootEl: null,
   mode: 1,                     // 1 = 直注模式, 2 = 总结模式
   autoListen: false,
+  useBuiltinCf: true,          // 默认开启内置 CF Worker 代理
   pollTimer: null,
   pollInterval: 2000,           // 2秒检测一次（之前 300ms 太频繁导致 Roche reactive 系统变卡）
   isPolling: false,            // 关键：全局锁，防止 pollOnce 并发执行
@@ -76,6 +83,7 @@ let runtime = {
 const STORE_KEYS = {
   mode: 'xhs_mode',
   autoListen: 'xhs_auto_listen',
+  useBuiltinCf: 'xhs_use_builtin_cf',
   selectedIds: 'xhs_selected_ids',
   processedLinks: 'xhs_processed_links',
   deleteAfterCount: 'xhs_delete_after_count',
@@ -232,20 +240,23 @@ async function smartFetch(proxyUrl, options = {}, timeoutMs = 15000) {
 /**
  * 返回 HTML 抓取的代理列表（按环境排序）
  *
- * 浏览器环境：
- *   - CF Worker 优先（如果配置了通用版 Worker，能处理 HTML）
- *   - allorigins JSON 模式次之（CORS 头最友好）
- *   - corsproxy 仅在 APK 或 localhost 可用（免费版 Origin 白名单限制）
- *
  * APK 环境：保持原顺序（corsproxy 优先，已验证可用）
+ *   - 内置 CF Worker 不使用（APK corsproxy 可用且更快）
+ *   - 用户自定义 CF Worker 优先用于图片（保持原行为）
+ *
+ * 浏览器环境：
+ *   - 内置 CF Worker 优先（如果开关开启）→ 处理 HTML+图片
+ *   - 用户自定义 CF Worker 次之
+ *   - allorigins JSON 模式再次之
+ *   - corsproxy 仅在 localhost 可用（免费版 Origin 白名单限制）
  */
-function getHtmlProxies(cfWorker) {
+function getHtmlProxies(cfWorker, useBuiltin) {
   const isApk = isApkWebView();
   if (isApk) {
     log(`环境检测: APK WebView (UA: ${(navigator.userAgent||'').substring(0,50)}...)`, 'info');
     return [
-      // APK 中 CF Worker 优先（如果配置了）
-      ...(cfWorker ? [{ name: 'CF-Worker', fn: (u) => cfWorker.replace(/\/$/, '') + '?type=html&url=' + encodeURIComponent(u) }] : []),
+      // APK 中用户自定义 CF Worker 优先
+      ...(cfWorker ? [{ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) }] : []),
       { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
       { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
       { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
@@ -255,17 +266,20 @@ function getHtmlProxies(cfWorker) {
   // 浏览器环境（含本地 file://）
   const isLocal = isBrowserLocalFile();
   const origin = (typeof location !== 'undefined' ? location.origin : 'unknown');
-  log(`环境检测: 浏览器 (本地文件: ${isLocal}, Origin: ${origin})`, 'info');
+  log(`环境检测: 浏览器 (本地文件: ${isLocal}, Origin: ${origin}, 内置代理: ${useBuiltin ? '开启' : '关闭'})`, 'info');
   if (!isLocal && origin && !/^(https?:\/\/(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.))/i.test(origin)) {
-    log(`⚠️ 当前 Origin 不在 corsproxy 免费白名单 → corsproxy 将返回 403`, 'warn');
-    if (!cfWorker) {
-      log(`⚠️ 建议在设置中配置 CF Worker 地址（可同时处理 HTML 和图片）`, 'warn');
+    if (!cfWorker && !useBuiltin) {
+      log(`⚠️ 当前 Origin 不在 corsproxy 免费白名单 → corsproxy 将返回 403，建议开启内置代理或配置自定义 CF Worker`, 'warn');
     }
   }
   const proxies = [];
-  // CF Worker 优先（如果配置了通用版 Worker）
+  // 内置 CF Worker 优先（浏览器端默认开启）
+  if (useBuiltin) {
+    proxies.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+  }
+  // 用户自定义 CF Worker 次之
   if (cfWorker) {
-    proxies.push({ name: 'CF-Worker', fn: (u) => cfWorker.replace(/\/$/, '') + '?type=html&url=' + encodeURIComponent(u) });
+    proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
   }
   // allorigins JSON 模式 - 返回 {contents: "..."}，CORS 头最完整
   proxies.push({ name: 'allorigins-json', fn: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, jsonMode: true });
@@ -279,7 +293,6 @@ function getHtmlProxies(cfWorker) {
   if (isLocal || /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)/i.test(origin)) {
     proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
   } else {
-    // 非 localhost 环境，corsproxy 必然 403，放最后仅作尝试
     proxies.push({ name: 'corsproxy(403预期)', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
   }
   return proxies;
@@ -288,20 +301,26 @@ function getHtmlProxies(cfWorker) {
 /**
  * 返回图片下载的代理列表（按环境排序）
  */
-function getImageProxies(cfWorker) {
+function getImageProxies(cfWorker, useBuiltin) {
   const proxies = [];
-  // CF Worker 始终优先（用户自部署，最稳定）
-  if (cfWorker) {
-    proxies.push({ name: 'CF-Worker', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-  }
-  if (isApkWebView()) {
-    // APK 环境：原顺序
+  const isApk = isApkWebView();
+  if (isApk) {
+    // APK 环境：用户自定义 CF Worker 优先（防盗链），然后公共代理
+    if (cfWorker) {
+      proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    }
     proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
     proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
     proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
     proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
   } else {
-    // 浏览器环境：allorigins 优先（CORS 友好）
+    // 浏览器环境：内置 CF Worker 优先（如果开启）
+    if (useBuiltin) {
+      proxies.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    }
+    if (cfWorker) {
+      proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    }
     proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
     proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
     proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
@@ -324,11 +343,15 @@ const CORS_PROXIES = [
 async function fetchXhsHtml(xhsUrl) {
   // 读取 CF Worker 地址（通用版可同时处理 HTML 和图片）
   const cfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
+  const useBuiltin = runtime.useBuiltinCf;
+  if (useBuiltin) {
+    log(`fetchXhsHtml: 内置代理已开启，将优先使用内置代理`, 'info');
+  }
   if (cfWorker) {
-    log(`fetchXhsHtml: 检测到 CF Worker 配置，将优先使用`, 'info');
+    log(`fetchXhsHtml: 检测到自定义 CF Worker 配置`, 'info');
   }
   // 根据环境动态选择代理顺序
-  const proxies = getHtmlProxies(cfWorker);
+  const proxies = getHtmlProxies(cfWorker, useBuiltin);
 
   let lastErr = null;
   const errors = [];
@@ -454,8 +477,9 @@ function extractPreview(note, maxLen = 100) {
 
 async function downloadImageAsDataUrl(imageUrl) {
   const cfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
+  const useBuiltin = runtime.useBuiltinCf;
   // 按环境动态选择代理顺序
-  const proxies = getImageProxies(cfWorker);
+  const proxies = getImageProxies(cfWorker, useBuiltin);
 
   const errors = [];
   for (let i = 0; i < proxies.length; i++) {
@@ -1366,7 +1390,7 @@ async function initApp(root, roche) {
   };
 
   // 加载配置
-  const [mode, sel, proc, auto, deleteAfter, delText, delImgs, presets, activePresetId] = await Promise.all([
+  const [mode, sel, proc, auto, deleteAfter, delText, delImgs, presets, activePresetId, useBuiltinCf] = await Promise.all([
     rocheStorage.get(STORE_KEYS.mode),
     rocheStorage.get(STORE_KEYS.selectedIds),
     rocheStorage.get(STORE_KEYS.processedLinks),
@@ -1375,13 +1399,14 @@ async function initApp(root, roche) {
     rocheStorage.get(STORE_KEYS.deleteTextEnabled),
     rocheStorage.get(STORE_KEYS.deleteImagesEnabled),
     rocheStorage.get(STORE_KEYS.apiPresets),
-    rocheStorage.get(STORE_KEYS.activePresetId)
+    rocheStorage.get(STORE_KEYS.activePresetId),
+    rocheStorage.get(STORE_KEYS.useBuiltinCf)
   ]);
   runtime.mode = mode || 1;
   runtime.selectedIds = sel || [];
   runtime.processedLinks = proc || {};
-  // 恢复上次的 autoListen 状态（用于面板 loading 时同步 UI）
   runtime.autoListen = auto === true;
+  runtime.useBuiltinCf = useBuiltinCf !== false; // 默认开启
   runtime.deleteAfterCount = deleteAfter || 10;
   runtime.deleteTextEnabled = delText !== false;
   runtime.deleteImagesEnabled = delImgs !== false;
@@ -1412,7 +1437,7 @@ async function initApp(root, roche) {
   const ball = document.getElementById('xhs-floating-ball');
   if (ball) ball.style.display = 'none';
   updateBallStatus(runtime.autoListen ? 'listening' : 'idle', runtime.autoListen ? '小红书注入器 (监听中)' : '小红书注入器 (未监听)');
-  log('插件已加载 v2.4.2', 'success');
+  log('插件已加载 v2.6.0', 'success');
 }
 
 function cleanup() {
@@ -1473,7 +1498,7 @@ function render(root) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="flex:1;min-width:0;">
           <h2 class="xhs-title">小红书链接注入器</h2>
-          <p class="xhs-subtitle">v2.4.2 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
+          <p class="xhs-subtitle">v2.6.0 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
         </div>
         <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
       </div>
@@ -1679,33 +1704,70 @@ $1
       <!-- 设置 -->
       <section class="xhs-panel" id="xhs-panel-settings">
         <div class="xhs-field">
-          <label class="xhs-label">Cloudflare Worker 代理地址（可选）</label>
-          <input type="text" class="xhs-input" id="xhs-cf-worker" placeholder="https://xxx.your-name.workers.dev" />
-          <div class="xhs-hint" style="margin-top:6px;">模式一和模式二下载图片时都会使用（绕过小红书防盗链）。留空则使用公共代理。</div>
+          <label class="xhs-label">内置代理（推荐开启）</label>
+          <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;">
+            <input type="checkbox" id="xhs-builtin-cf-toggle" ${runtime.useBuiltinCf ? 'checked' : ''} style="margin-top:2px;flex:0 0 auto;" />
+            <div style="font-size:13px;line-height:1.6;">
+              <strong>使用内置 CF Worker 代理</strong>（默认开启）<br/>
+              <span style="color:var(--xhs-text-dim);">
+                浏览器端自动使用官方代理解决 corsproxy 403 问题，无需自行部署。<br/>
+                该代理仅处理小红书公开数据（笔记链接、HTML页面、图片），<strong>不经过任何用户隐私数据</strong>（聊天内容、角色人设、API Key 等均不经此代理）。<br/>
+                若不放心可关闭，或填入自己的 CF Worker 地址。<br/>
+                <strong>APK 端不受此开关影响</strong>，APK 默认走公共代理（corsproxy 可用）。
+              </span>
+            </div>
+          </label>
         </div>
         <div class="xhs-field">
-          <label class="xhs-label">Worker 部署教程</label>
+          <label class="xhs-label">自定义 Cloudflare Worker 代理地址（可选）</label>
+          <input type="text" class="xhs-input" id="xhs-cf-worker" placeholder="https://xxx.your-name.workers.dev" />
+          <div class="xhs-hint" style="margin-top:6px;">下载图片和抓取HTML时优先使用。开启内置代理后，自定义代理作为备选。留空则仅使用内置代理+公共代理。</div>
+        </div>
+        <div class="xhs-field">
+          <label class="xhs-label">Worker 部署教程（如果想自己部署）</label>
           <div style="font-size:12px;color:var(--xhs-text-dim);line-height:1.7;padding:10px;background:var(--xhs-bg-soft);border:1px solid var(--xhs-border);border-radius:8px;">
-            1. 注册 <a href="https://dash.cloudflare.com" target="_blank" style="color:var(--xhs-accent);">Cloudflare</a>（免费）<br/>
-            2. 左侧菜单 Workers 和 Pages → 创建<br/>
-            3. 创建 Worker → 起名 → 粘贴脚本 → 部署<br/>
-            4. 复制地址填到上面 → 保存
+            1. 注册 <a href="https://dash.cloudflare.com" target="_blank" style="color:var(--xhs-accent);">Cloudflare</a>（免费，建议手机端用谷歌商店注册谷歌账号再注册CF，被封了申诉基本会成功）<br/>
+            2. 左侧菜单 Workers 和 Pages → 创建应用程序 → 创建 Worker<br/>
+            3. 起名 → 部署 → 编辑代码 → 粘贴下方脚本 → 部署<br/>
+            4. 复制 workers.dev 地址填到上面 → 保存
           </div>
         </div>
         <div class="xhs-field">
           <label class="xhs-label">Worker 脚本（复制这段）</label>
           <textarea class="xhs-input" readonly rows="10" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">export default {
   async fetch(request) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: {
+        'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,OPTIONS',
+        'Access-Control-Allow-Headers': '*', 'Access-Control-Max-Age': '86400'
+      }});
+    }
     const url = new URL(request.url);
     const target = url.searchParams.get('url');
-    if (!target) return new Response('missing url', { status: 400 });
-    const resp = await fetch(target, {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.xiaohongshu.com/' }
+    if (!target) return new Response('xhs-proxy ready. Usage: ?url=<xhs_url>', {
+      status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain; charset=utf-8' }
     });
-    const body = await resp.arrayBuffer();
-    const headers = new Headers(resp.headers);
-    headers.set('Access-Control-Allow-Origin', '*');
-    return new Response(body, { status: resp.status, headers });
+    try {
+      const resp = await fetch(target, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Referer': 'https://www.xiaohongshu.com/',
+          'Accept': '*/*'
+        }
+      });
+      const body = await resp.arrayBuffer();
+      const headers = new Headers(resp.headers);
+      headers.set('Access-Control-Allow-Origin', '*');
+      headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+      headers.set('Access-Control-Allow-Headers', '*');
+      headers.delete('content-security-policy');
+      headers.delete('x-frame-options');
+      return new Response(body, { status: resp.status, headers });
+    } catch (e) {
+      return new Response('fetch error: ' + e.message, {
+        status: 502, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain' }
+      });
+    }
   }
 }</textarea>
         </div>
@@ -1854,30 +1916,45 @@ function bindEvents(roche) {
         b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
       });
       const sub = root.querySelector('.xhs-subtitle');
-      if (sub) sub.textContent = `v2.4.2 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
+      if (sub) sub.textContent = `v2.6.0 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
       roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
       log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
     });
   });
 
-  // 加载 CF Worker 配置
+  // 加载 CF Worker 配置 + 内置代理开关
   (async () => {
     try {
       const savedCfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
       if (savedCfWorker && root.querySelector('#xhs-cf-worker')) {
         root.querySelector('#xhs-cf-worker').value = savedCfWorker;
       }
+      const savedBuiltin = await rocheStorage.get(STORE_KEYS.useBuiltinCf);
+      if (savedBuiltin !== undefined && savedBuiltin !== null && root.querySelector('#xhs-builtin-cf-toggle')) {
+        runtime.useBuiltinCf = savedBuiltin !== false;
+        root.querySelector('#xhs-builtin-cf-toggle').checked = runtime.useBuiltinCf;
+      }
     } catch (e) {}
   })();
+
+  // 内置代理开关
+  const builtinToggle = root.querySelector('#xhs-builtin-cf-toggle');
+  if (builtinToggle) {
+    builtinToggle.addEventListener('change', async (e) => {
+      runtime.useBuiltinCf = e.target.checked;
+      await rocheStorage.set(STORE_KEYS.useBuiltinCf, runtime.useBuiltinCf);
+      roche.ui.toast(runtime.useBuiltinCf ? '已开启内置代理' : '已关闭内置代理');
+    });
+  }
 
   // 保存 CF Worker
   root.querySelector('#xhs-save-settings').addEventListener('click', async () => {
     const workerUrl = root.querySelector('#xhs-cf-worker').value.trim();
     await rocheStorage.set(STORE_KEYS.cfWorker, workerUrl);
     if (workerUrl) {
-      roche.ui.toast('已保存 CF Worker 地址');
+      roche.ui.toast('已保存自定义 CF Worker 地址');
     } else {
-      roche.ui.toast('已清空，将使用公共代理');
+      roche.ui.toast('设置已保存');
     }
   });
 

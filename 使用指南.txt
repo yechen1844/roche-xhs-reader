@@ -1,5 +1,5 @@
 ============================================================
-  小红书链接注入器——使用指南 v2.4.2
+  小红书链接注入器——使用指南 v2.6.0
 ============================================================
 
 📌 一、安装插件
@@ -20,6 +20,8 @@
      插件会自动抓取笔记内容、下载图片，替换成 AI 可读格式注入聊天
 
   *** 关闭插件面板后监听依然在后台运行，无需一直开着面板 ***
+
+  *** v2.6.0 起，浏览器端默认开启内置代理，开箱即用，无需任何配置 ***
 
 
 📌 三、两种运行模式
@@ -55,68 +57,87 @@
   5. 回到主面板，切换到「模式二」
 
 
-📌 五、配置 Cloudflare Worker（强烈推荐！同时解决 HTML 抓取和图片下载）
+📌 五、代理设置（v2.6.0 更新）
 
-  小红书图片有防盗链，公共 CORS 代理对浏览器不友好。
-  corsproxy.io 免费版仅允许 localhost/GitHub.io 等 Origin 白名单，
-  浏览器从其他网站打开 HTML 时 corsproxy 必然返回 403。
-  APK WebView 不发 Origin 所以能用，浏览器发 Origin 必然被拒。
+  v2.6.0 起，插件内置了官方 CF Worker 代理（默认开启），
+  浏览器端开箱即用，无需任何配置。
 
-  部署自己的 Cloudflare Worker 后：
-  - HTML 抓取走 CF Worker（彻底绕过 corsproxy 403）
-  - 图片下载走 CF Worker（绕过小红书防盗链）
-  - 行为与 APK 完全一致
+  --- 内置代理说明 ---
+  - 默认开启，浏览器端自动使用，解决 corsproxy 403 问题
+  - 该代理仅处理小红书公开数据：笔记链接、HTML页面、小红书图片
+  - 不经过任何用户隐私数据：聊天内容、角色人设、API Key 等均不经此代理
+  - APK 端不受此开关影响（APK 默认走公共代理，corsproxy 在 APK 中可用）
+  - 如果不放心，可以关闭内置代理，或自己部署 CF Worker 填入
 
-  以下是详细步骤（免费，无需服务器）：
+  --- 关闭/开启内置代理 ---
+  1. 进入「设置」标签页
+  2. 找到「内置代理（推荐开启）」区域
+  3. 勾选/取消勾选「使用内置 CF Worker 代理」
+  4. 设置自动保存
+
+  --- 自定义 CF Worker（可选）---
+  如果你想自己部署 CF Worker（最推荐 APK 用户自己部署，稳定性最好），
+  可以填入自己的 Worker 地址，自定义代理会作为内置代理的备选。
+
+  部署自己的 Cloudflare Worker 步骤（免费，无需服务器）：
 
   === 第一步：注册 Cloudflare ===
   1. 打开 https://dash.cloudflare.com/sign-up
   2. 用邮箱注册账号，不需要绑信用卡
-  3. 注册完成后自动进入 Cloudflare 仪表盘（Dashboard）
+  3. 建议手机端用谷歌商店注册谷歌账号再注册CF，被封了申诉基本会成功（机器人审核，申诉即过）
+  4. 注册完成后自动进入 Cloudflare 仪表盘
 
   === 第二步：创建 Worker ===
-  1. 在左侧菜单找到「Workers 和 Pages」（Workers & Pages）
-  2. 点击「创建」（Create）
-  3. 选择「创建 Worker」（Create Worker）
-  4. 给 Worker 起个名字，例如：xhs-proxy
-  5. 点击「部署」（Deploy），此时 Worker 创建完成
+  1. 左侧菜单「Workers 和 Pages」→ 点「创建应用程序」→「创建 Worker」
+  2. 给 Worker 起个名字，例如：xhs-proxy
+  3. 点击「部署」
 
-  === 第三步：编辑 Worker 代码 ===
-  1. 在刚创建的 Worker 页面，点击「编辑代码」（Edit code）
-  2. 把编辑器里的默认代码全部删掉
-  3. 粘贴以下代码（注意：必须完全覆盖，一个字不漏）：
+  === 第三步：编辑代码 ===
+  1. 点击「编辑代码」，把默认代码全删掉，粘贴以下代码：
 
 ------------------------------------------------------------
 export default {
   async fetch(request) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: {
+        'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,OPTIONS',
+        'Access-Control-Allow-Headers': '*', 'Access-Control-Max-Age': '86400'
+      }});
+    }
     const url = new URL(request.url);
     const target = url.searchParams.get('url');
-    if (!target) return new Response('missing url', { status: 400 });
-    const resp = await fetch(target, {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.xiaohongshu.com/' }
+    if (!target) return new Response('xhs-proxy ready. Usage: ?url=<xhs_url>', {
+      status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain; charset=utf-8' }
     });
-    const body = await resp.arrayBuffer();
-    const headers = new Headers(resp.headers);
-    headers.set('Access-Control-Allow-Origin', '*');
-    return new Response(body, { status: resp.status, headers });
+    try {
+      const resp = await fetch(target, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Referer': 'https://www.xiaohongshu.com/',
+          'Accept': '*/*'
+        }
+      });
+      const body = await resp.arrayBuffer();
+      const headers = new Headers(resp.headers);
+      headers.set('Access-Control-Allow-Origin', '*');
+      headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+      headers.set('Access-Control-Allow-Headers', '*');
+      headers.delete('content-security-policy');
+      headers.delete('x-frame-options');
+      return new Response(body, { status: resp.status, headers });
+    } catch (e) {
+      return new Response('fetch error: ' + e.message, {
+        status: 502, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain' }
+      });
+    }
   }
 }
 ------------------------------------------------------------
 
-  4. 点击右上角「部署」（Deploy）
-  5. 部署成功后，页面上会显示 Worker 的网址，
-     格式类似：https://xhs-proxy.你的用户名.workers.dev
-
-  === 第四步：填入插件 ===
-  1. 复制上面那个 Worker 网址（完整的 https:// 开头）
-  2. 回到 Roche 小红书注入器 → 「设置」标签页
-  3. 粘贴到「Cloudflare Worker 代理地址」输入框
-  4. 点击「保存设置」
-  5. 完成！之后插件抓取 HTML 和下载图片时都会优先通过你的 Worker
-
-  ⚠️ 重要：浏览器打开 HTML 时如果不配置 CF Worker，
-     corsproxy 必然返回 403（这是 corsproxy.io 的政策，无法绕过），
-     只能用不稳定的公共代理。强烈建议配置 CF Worker。
+  2. 点击「部署」
+  3. 复制 Worker 网址（格式：https://xhs-proxy.你的用户名.workers.dev）
+  4. 回到插件「设置」标签页，粘贴到「自定义 Cloudflare Worker 代理地址」
+  5. 点击「保存设置」
 
 
 📌 六、手动注入
@@ -147,38 +168,49 @@ export default {
   2. 最多同时监听 3 个会话
   3. 注入后原消息会被替换，你发的链接+文字会消失，变成笔记内容
   4. 模式一只注入最多 9 张图片
-  5. 如果图片下载失败（非 Cloudflare 用户常见），
-     文本和评论依然会正常注入，只是缺少图片
+  5. 如果内置代理不可用，可以在设置中关闭，使用公共代理或自己的 Worker
   6. 不需要保持插件面板打开，关闭面板监听照常工作
-  7. Cloudflare Worker 完全免费，每天有 10 万次请求额度
+  7. Cloudflare Worker 完全免费，每天有 10 万次请求额度（内置代理也是免费的）
 
 
 📌 十、常见问题
 
   Q: 注入后聊天界面没刷新？
-  A: 切到另一个聊天再切回来即可看到。如果 Pinia 方案工作正常，
-     应该会无缝刷新（无感知），如果不行会自动用 viewStack 强制刷新。
+  A: 切到另一个聊天再切回来即可看到。插件会尝试自动刷新（Pinia splice
+     → 事件派发 → viewStack 强制刷新三方案降级），极端情况手动切一下。
 
-  Q: 图片总下载失败？
-  A: 有很大概率是因为没有配 Cloudflare Worker。
-     参考第五节部署一个自己的 Worker，成功率会大幅提升。
+  Q: 图片下载失败？
+  A: 浏览器端请确保内置代理开关开启（默认开启）。如果内置代理不可用
+     （极少数网络环境），可以自己部署 CF Worker 填入自定义地址。
 
   Q: 浏览器打开 HTML 时 corsproxy 返回 403？
-  A: 这是 corsproxy.io 的政策：免费版仅允许 localhost/GitHub.io 等
-     Origin 白名单。浏览器从其他网站打开 HTML 必然 403，无法绕过。
-     解决方案：配置 CF Worker（参考第五节），HTML 也走 CF Worker。
+  A: 这是 corsproxy.io 免费版的政策：仅允许 localhost/GitHub.io 等
+     Origin 白名单。v2.6.0 已内置官方代理解决此问题，请确保内置代理
+     开关为开启状态（设置中第一个开关，默认开启）。
 
   Q: APK 中能用 corsproxy，浏览器中不能？
   A: APK WebView 不发 Origin header，corsproxy 认为"服务器端请求"放行。
-     浏览器强制发 Origin，corsproxy 检查 Origin 白名单，不在白名单返回 403。
-     这是浏览器与 APK 的根本差异，只能用 CF Worker 绕过。
+     浏览器强制发 Origin，corsproxy 检查白名单返回 403。
+     v2.6.0 内置代理已解决此问题。
+
+  Q: 内置代理安全吗？我的隐私数据会被看到吗？
+  A: 内置代理仅处理小红书公开数据（笔记链接、HTML页面、图片）。
+     你的聊天内容、角色人设、API Key 等隐私数据完全在你本地设备处理，
+     不经过任何代理服务器。如果仍不放心，可以关闭内置代理，
+     自己部署 CF Worker 填入自定义地址。
 
   Q: 副 API 连接测试失败？
   A: 检查 Base URL 是否正确（注意不要多/少 /v1），
      API Key 是否还有余额，模型名是否拼写正确。
 
+  Q: workers.dev 在国内访问不了？
+  A: 部分网络环境下 workers.dev 可能被阻断。如果遇到此问题，
+     最推荐的方案是 APK 端使用（APK 走 corsproxy 不需要 CF Worker），
+     浏览器端可以自己部署 CF Worker 并绑定自定义域名（需要一个域名，
+     将 NS 指向 Cloudflare 即可，国内可正常访问）。
+
 
 ============================================================
   文件版本：2026-07-19
-  插件版本：v2.5.1
+  插件版本：v2.6.0
 ============================================================
