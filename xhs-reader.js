@@ -1,5 +1,5 @@
 /**
- * Roche 小红书链接注入器 v2.6.5
+ * Roche 小红书链接注入器 v2.6.6
  *
  * 模式一（直注模式）：原文 + 独立图片消息
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
@@ -25,7 +25,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.6.5",
+  version: "2.6.6",
   apps: [
     {
       id: "xhs-reader-home",
@@ -254,46 +254,36 @@ function getHtmlProxies(cfWorker, useBuiltin) {
   const isApk = isApkWebView();
   if (isApk) {
     log(`环境检测: APK WebView (UA: ${(navigator.userAgent||'').substring(0,50)}...)`, 'info');
-    return [
-      // APK 中用户自定义 CF Worker 优先
-      ...(cfWorker ? [{ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) }] : []),
+    // APK 端：corsproxy 优先（用户要求保持原逻辑），但加入内置 CF 作为后备
+    const list = [
       { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
       { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
       { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
       { name: 'allorigins-raw', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` }
     ];
+    // 内置 CF 和自定义 CF 作为后备（放在公共代理之后）
+    if (useBuiltin) {
+      list.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    }
+    if (cfWorker) {
+      list.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    }
+    return list;
   }
-  // 浏览器环境（含本地 file://）
+  // 浏览器端（含本地 file://）：文字只走 CF，公共代理会返回桌面版 HTML（无评论）
   const isLocal = isBrowserLocalFile();
   const origin = (typeof location !== 'undefined' ? location.origin : 'unknown');
   log(`环境检测: 浏览器 (本地文件: ${isLocal}, Origin: ${origin}, 内置代理: ${useBuiltin ? '开启' : '关闭'})`, 'info');
-  if (!isLocal && origin && !/^(https?:\/\/(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.))/i.test(origin)) {
-    if (!cfWorker && !useBuiltin) {
-      log(`⚠️ 当前 Origin 不在 corsproxy 免费白名单 → corsproxy 将返回 403，建议开启内置代理或配置自定义 CF Worker`, 'warn');
-    }
-  }
   const proxies = [];
-  // 内置 CF Worker 优先（浏览器端默认开启）
   if (useBuiltin) {
+    // 内置 CF 开启 → 走内置 CF（自定义 CF 作为后备降级）
     proxies.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
   }
-  // 用户自定义 CF Worker 次之
   if (cfWorker) {
     proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
   }
-  // allorigins JSON 模式 - 返回 {contents: "..."}，CORS 头最完整
-  proxies.push({ name: 'allorigins-json', fn: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, jsonMode: true });
-  // codetabs - 长期稳定，CORS 支持好
-  proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
-  // thingproxy
-  proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
-  // allorigins raw 模式（备用）
-  proxies.push({ name: 'allorigins-raw', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
-  // corsproxy 仅在 localhost 有效（其他 Origin 会 403）
-  if (isLocal || /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)/i.test(origin)) {
-    proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
-  } else {
-    proxies.push({ name: 'corsproxy(403预期)', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
+  if (proxies.length === 0) {
+    log(`⚠️ 浏览器端未启用任何 CF Worker，无法抓取（公共代理返回桌面版 HTML 无评论数据）`, 'warn');
   }
   return proxies;
 }
@@ -305,26 +295,23 @@ function getImageProxies(cfWorker, useBuiltin) {
   const proxies = [];
   const isApk = isApkWebView();
   if (isApk) {
-    // APK 环境：用户自定义 CF Worker 优先（防盗链），然后公共代理
-    if (cfWorker) {
-      proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-    }
-    proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
-    proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
-    proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
-    proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
-  } else {
-    // 浏览器环境：内置 CF Worker 优先（如果开启）
+    // APK 端图片：只走 CF（内置 CF 优先 → 自定义 CF），没有则不注入图片
+    // 不再走公共代理（公共代理返回的图片可能被防盗链拦截，且不符合用户要求）
     if (useBuiltin) {
       proxies.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     }
     if (cfWorker) {
       proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     }
-    proxies.push({ name: 'allorigins', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
-    proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
-    proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
-    proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
+    // proxies 为空时 → downloadImageAsDataUrl 会抛错，processMode1 的 try/catch 会跳过该图片
+  } else {
+    // 浏览器端图片：与文字一致，只走 CF
+    if (useBuiltin) {
+      proxies.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    }
+    if (cfWorker) {
+      proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    }
   }
   return proxies;
 }
@@ -344,14 +331,16 @@ async function fetchXhsHtml(xhsUrl) {
   // 读取 CF Worker 地址（通用版可同时处理 HTML 和图片）
   const cfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
   const useBuiltin = runtime.useBuiltinCf;
+  // 环境识别
+  const isApk = isApkWebView();
+  const isLocal = isBrowserLocalFile();
+  log(`fetchXhsHtml: 环境=${isApk ? 'APK' : '浏览器'}${isLocal ? '(本地文件)' : ''}, 内置代理=${useBuiltin ? '开' : '关'}, 自定义CF=${cfWorker ? '有' : '无'}`, 'info');
   if (useBuiltin) {
-    log(`fetchXhsHtml: 内置代理已开启，将优先使用内置代理`, 'info');
-  }
-  if (cfWorker) {
-    log(`fetchXhsHtml: 检测到自定义 CF Worker 配置`, 'info');
+    log(`fetchXhsHtml: 内置代理地址: ${BUILTIN_CF_WORKER}`, 'info');
   }
   // 根据环境动态选择代理顺序
   const proxies = getHtmlProxies(cfWorker, useBuiltin);
+  log(`fetchXhsHtml: 代理顺序 = ${proxies.map(p => p.name).join(' → ')}`, 'info');
 
   let lastErr = null;
   const errors = [];
@@ -481,6 +470,9 @@ async function downloadImageAsDataUrl(imageUrl) {
   const useBuiltin = runtime.useBuiltinCf;
   // 按环境动态选择代理顺序
   const proxies = getImageProxies(cfWorker, useBuiltin);
+  if (proxies.length === 0) {
+    throw new Error('未配置图片代理（请开启内置 CF 或配置自定义 CF Worker）');
+  }
 
   const errors = [];
   for (let i = 0; i < proxies.length; i++) {
