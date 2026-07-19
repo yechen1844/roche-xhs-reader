@@ -1,5 +1,5 @@
 /**
- * Roche 小红书链接注入器 v2.6.3
+ * Roche 小红书链接注入器 v2.6.5
  *
  * 模式一（直注模式）：原文 + 独立图片消息
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
@@ -25,7 +25,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.6.3",
+  version: "2.6.5",
   apps: [
     {
       id: "xhs-reader-home",
@@ -391,7 +391,18 @@ async function fetchXhsHtml(xhsUrl) {
         html = await resp.text();
       }
       log(`fetchXhsHtml: [${proxyName}] OK, ${html.length} 字节`, 'success');
-      if (html && html.includes('__INITIAL_STATE__')) return html;
+      if (html && html.includes('__INITIAL_STATE__')) {
+        // 严格验证：必须是 iPhone UA 返回的移动版 HTML（含 commentData）
+        // 桌面版 HTML（Chrome UA）虽然也有 __INITIAL_STATE__ 但评论为空，不能接受
+        if (html.includes('commentData')) {
+          log(`fetchXhsHtml: [${proxyName}] 移动版 HTML（含评论数据），采用`, 'success');
+          return html;
+        }
+        log(`fetchXhsHtml: [${proxyName}] 桌面版 HTML（无 commentData），跳过`, 'warn');
+        lastErr = new Error('桌面版 HTML 无评论数据');
+        errors.push(`${proxyName}: 桌面版无评论`);
+        continue;
+      }
       lastErr = new Error('页面未包含 __INITIAL_STATE__');
       errors.push(`${proxyName}: 无 __INITIAL_STATE__`);
     } catch (e) {
@@ -414,28 +425,13 @@ function parseXhsState(html) {
 }
 
 function extractNote(state) {
-  let note = state?.noteData?.data?.noteData;
-  if (!note && state?.note?.noteDetailMap) {
-    const map = state.note.noteDetailMap;
-    const firstKey = Object.keys(map)[0];
-    note = firstKey ? map[firstKey]?.note : null;
-  }
-  return note;
+  // 只支持 iPhone UA 返回的移动版结构
+  return state?.noteData?.data?.noteData || null;
 }
 
 function extractComments(state) {
-  // 兼容两种 UA 返回的数据结构：
-  // - iPhone UA（移动版，有首屏评论）：state.noteData.data.commentData.comments
-  // - Chrome UA（桌面版，无首屏评论）：state.note.noteDetailMap[id].comments.list
-  const cd = state?.noteData?.data?.commentData;
-  if (cd?.comments?.length) return cd;
-  if (state?.note?.noteDetailMap) {
-    const map = state.note.noteDetailMap;
-    const firstKey = Object.keys(map)[0];
-    const c = firstKey ? map[firstKey]?.comments : null;
-    if (c) return c;
-  }
-  return null;
+  // 只支持 iPhone UA 返回的移动版结构
+  return state?.noteData?.data?.commentData || null;
 }
 
 const MAX_IMAGES = 9;
@@ -1447,7 +1443,7 @@ async function initApp(root, roche) {
   const ball = document.getElementById('xhs-floating-ball');
   if (ball) ball.style.display = 'none';
   updateBallStatus(runtime.autoListen ? 'listening' : 'idle', runtime.autoListen ? '小红书注入器 (监听中)' : '小红书注入器 (未监听)');
-  log('插件已加载 v2.6.3', 'success');
+  log('插件已加载 v2.6.5', 'success');
 }
 
 function cleanup() {
@@ -1508,7 +1504,7 @@ function render(root) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="flex:1;min-width:0;">
           <h2 class="xhs-title">小红书链接注入器</h2>
-          <p class="xhs-subtitle">v2.6.3 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
+          <p class="xhs-subtitle">v2.6.5 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
         </div>
         <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
       </div>
@@ -1926,7 +1922,7 @@ function bindEvents(roche) {
         b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
       });
       const sub = root.querySelector('.xhs-subtitle');
-      if (sub) sub.textContent = `v2.6.3 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
+      if (sub) sub.textContent = `v2.6.5 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
       roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
       log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
     });

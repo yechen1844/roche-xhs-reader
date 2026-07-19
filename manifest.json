@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.6.3",
-  "description": "小红书链接注入器 v2.6.3：修复首屏评论抓取（CF Worker 改用 iPhone UA，小红书才会返回包含首屏评论的移动版 HTML）。内置官方 CF Worker 代理，浏览器端开箱即用。",
+  "version": "2.6.5",
+  "description": "小红书链接注入器 v2.6.5：严格验证 HTML 必须含 commentData（iPhone UA 移动版），桌面版 HTML（Chrome UA 无评论）直接跳过。CF Worker 已使用 iPhone UA。",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",
