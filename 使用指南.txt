@@ -1,5 +1,5 @@
 ============================================================
-  小红书链接注入器——使用指南 v2.6.0
+  小红书链接注入器——使用指南 v2.6.1
 ============================================================
 
 📌 一、安装插件
@@ -21,7 +21,7 @@
 
   *** 关闭插件面板后监听依然在后台运行，无需一直开着面板 ***
 
-  *** v2.6.0 起，浏览器端默认开启内置代理，开箱即用，无需任何配置 ***
+  *** v2.6.1 起，浏览器端默认开启内置代理，开箱即用，无需任何配置 ***
 
 
 📌 三、两种运行模式
@@ -57,13 +57,14 @@
   5. 回到主面板，切换到「模式二」
 
 
-📌 五、代理设置（v2.6.0 更新）
+📌 五、代理设置（v2.6.1）
 
-  v2.6.0 起，插件内置了官方 CF Worker 代理（默认开启），
+  v2.6.1 起，插件内置了官方 CF Worker 代理（默认开启），
   浏览器端开箱即用，无需任何配置。
 
   --- 内置代理说明 ---
   - 默认开启，浏览器端自动使用，解决 corsproxy 403 问题
+  - 代理地址：https://xhs-proxy.luyi90720.workers.dev
   - 该代理仅处理小红书公开数据：笔记链接、HTML页面、小红书图片
   - 不经过任何用户隐私数据：聊天内容、角色人设、API Key 等均不经此代理
   - APK 端不受此开关影响（APK 默认走公共代理，corsproxy 在 APK 中可用）
@@ -84,7 +85,7 @@
   === 第一步：注册 Cloudflare ===
   1. 打开 https://dash.cloudflare.com/sign-up
   2. 用邮箱注册账号，不需要绑信用卡
-  3. 建议手机端用谷歌商店注册谷歌账号再注册CF，被封了申诉基本会成功（机器人审核，申诉即过）
+  3. 建议手机端用谷歌商店注册谷歌账号再注册 CF，被封了申诉基本会成功（机器人审核，申诉即过）
   4. 注册完成后自动进入 Cloudflare 仪表盘
 
   === 第二步：创建 Worker ===
@@ -100,14 +101,17 @@ export default {
   async fetch(request) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: {
-        'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,OPTIONS',
-        'Access-Control-Allow-Headers': '*', 'Access-Control-Max-Age': '86400'
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,OPTIONS',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Max-Age': '86400'
       }});
     }
     const url = new URL(request.url);
     const target = url.searchParams.get('url');
     if (!target) return new Response('xhs-proxy ready. Usage: ?url=<xhs_url>', {
-      status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain; charset=utf-8' }
+      status: 200,
+      headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain; charset=utf-8' }
     });
     try {
       const resp = await fetch(target, {
@@ -127,7 +131,8 @@ export default {
       return new Response(body, { status: resp.status, headers });
     } catch (e) {
       return new Response('fetch error: ' + e.message, {
-        status: 502, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain' }
+        status: 502,
+        headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain' }
       });
     }
   }
@@ -185,13 +190,13 @@ export default {
 
   Q: 浏览器打开 HTML 时 corsproxy 返回 403？
   A: 这是 corsproxy.io 免费版的政策：仅允许 localhost/GitHub.io 等
-     Origin 白名单。v2.6.0 已内置官方代理解决此问题，请确保内置代理
+     Origin 白名单。v2.6.1 已内置官方代理解决此问题，请确保内置代理
      开关为开启状态（设置中第一个开关，默认开启）。
 
   Q: APK 中能用 corsproxy，浏览器中不能？
   A: APK WebView 不发 Origin header，corsproxy 认为"服务器端请求"放行。
      浏览器强制发 Origin，corsproxy 检查白名单返回 403。
-     v2.6.0 内置代理已解决此问题。
+     v2.6.1 内置代理已解决此问题。
 
   Q: 内置代理安全吗？我的隐私数据会被看到吗？
   A: 内置代理仅处理小红书公开数据（笔记链接、HTML页面、图片）。
@@ -204,13 +209,32 @@ export default {
      API Key 是否还有余额，模型名是否拼写正确。
 
   Q: workers.dev 在国内访问不了？
-  A: 部分网络环境下 workers.dev 可能被阻断。如果遇到此问题，
-     最推荐的方案是 APK 端使用（APK 走 corsproxy 不需要 CF Worker），
-     浏览器端可以自己部署 CF Worker 并绑定自定义域名（需要一个域名，
-     将 NS 指向 Cloudflare 即可，国内可正常访问）。
+  A: 部分网络环境下 workers.dev 可能被阻断。如果遇到此问题：
+     - APK 端不受影响（走 corsproxy 公共代理）
+     - 浏览器端可以自己部署 CF Worker 并绑定自定义域名
+       （需要一个域名，将 NS 指向 Cloudflare 即可，国内可正常访问）
+     - 或者最简单：用 APK 端使用本插件
+
+
+📌 十一、环境差异说明
+
+  本插件针对两种运行环境做了优化：
+
+  1. APK 端（Android WebView）：
+     - 不发 Origin header，corsproxy 公共代理可用
+     - 不需要 CF Worker 也能正常抓取
+     - 不需要做任何配置，开箱即用
+
+  2. 浏览器端（Chrome/Edge/Safari 等）：
+     - 强制发 Origin header，corsproxy 必然返回 403
+     - 必须使用 CF Worker（内置或自定义）
+     - v2.6.1 起默认开启内置代理，开箱即用
+
+  内置代理开关只影响浏览器端，APK 端不受此开关影响。
 
 
 ============================================================
   文件版本：2026-07-19
-  插件版本：v2.6.0
+  插件版本：v2.6.1
+  内置 Worker：https://xhs-proxy.luyi90720.workers.dev
 ============================================================
