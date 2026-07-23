@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.6.6",
-  "description": "小红书链接注入器 v2.6.6：统一代理策略——网页端文字和图片只走 CF Worker（内置/自定义），移除公共代理避免桌面版 HTML 污染；APK 端文字保持公共代理优先，图片改为只走 CF Worker（内置优先→自定义后备），无 CF 时不注入图片。",
+  "version": "2.6.7",
+  "description": "小红书链接注入器 v2.6.7：支持小红书新版分享短链域名 xhslink.cn（如 http://xhslink.cn/o/xxx），同时兼容旧版 xhslink.com；其余沿用 v2.6.6 统一代理策略（网页端文字和图片只走 CF Worker 内置/自定义，APK 端文字走公共代理优先、图片只走 CF Worker）。",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",

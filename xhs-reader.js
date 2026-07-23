@@ -1,5 +1,8 @@
 /**
- * Roche 小红书链接注入器 v2.6.6
+ * Roche 小红书链接注入器 v2.6.7
+ *
+ * v2.6.7 更新：支持小红书新版分享短链域名 xhslink.cn（如 http://xhslink.cn/o/xxx），
+ *              旧版 xhslink.com 仍兼容；链接正则与校验同步覆盖两个域名。
  *
  * 模式一（直注模式）：原文 + 独立图片消息
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
@@ -25,7 +28,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.6.6",
+  version: "2.6.7",
   apps: [
     {
       id: "xhs-reader-home",
@@ -1019,10 +1022,11 @@ function extractXhsUrl(text) {
   if (!text) return null;
   // 从混合文本中匹配完整的小红书链接，支持：
   //   - 反引号/括号/引号包裹的链接
-  //   - 多段路径（xhslink.com/o/xxx）
+  //   - 多段路径（xhslink.com/o/xxx 或新版 xhslink.cn/o/xxx）
   //   - 各种小红书 URL 格式
+  //   - 同时支持旧域名 xhslink.com 与新域名 xhslink.cn
   // 遇到空白、中文标点、闭合括号、CJK 字符等结束
-  const m = text.match(/https?:\/\/(?:xhslink\.com\/[^\s`'"（()）,。！？；、）)\]》\u4e00-\u9fa5]+|www\.xiaohongshu\.com\/[^\s`'"（()）,。！？；、）)\]》\u4e00-\u9fa5]+)/);
+  const m = text.match(/https?:\/\/(?:xhslink\.(?:com|cn)\/[^\s`'"（()）,。！？；、）)\]》\u4e00-\u9fa5]+|www\.xiaohongshu\.com\/[^\s`'"（()）,。！？；、）)\]》\u4e00-\u9fa5]+)/);
   if (m) {
     return m[0].replace(/[,。！？；，、]+$/, '').trim();
   }
@@ -2000,7 +2004,7 @@ function bindEvents(roche) {
   root.querySelector('#xhs-preview-btn').addEventListener('click', async () => {
     const link = root.querySelector('#xhs-link-input').value.trim();
     if (!link) { roche.ui.toast('请输入链接'); return; }
-    if (!/xhslink\.com|xiaohongshu\.com/.test(link)) {
+    if (!/xhslink\.(?:com|cn)|xiaohongshu\.com/.test(link)) {
       roche.ui.toast('不是小红书链接'); return;
     }
     const previewEl = root.querySelector('#xhs-preview');
@@ -2038,7 +2042,7 @@ function bindEvents(roche) {
     const convId = root.querySelector('#xhs-conv-select').value;
     if (!link) { roche.ui.toast('请输入链接'); return; }
     if (!convId) { roche.ui.toast('请选择会话'); return; }
-    if (!/xhslink\.com|xiaohongshu\.com/.test(link)) {
+    if (!/xhslink\.(?:com|cn)|xiaohongshu\.com/.test(link)) {
       roche.ui.toast('不是小红书链接'); return;
     }
     roche.ui.toast('正在抓取...');
