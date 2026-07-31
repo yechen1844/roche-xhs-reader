@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.6.7",
-  "description": "小红书链接注入器 v2.6.7：支持小红书新版分享短链域名 xhslink.cn（如 http://xhslink.cn/o/xxx），同时兼容旧版 xhslink.com；其余沿用 v2.6.6 统一代理策略（网页端文字和图片只走 CF Worker 内置/自定义，APK 端文字走公共代理优先、图片只走 CF Worker）。",
+  "version": "2.8.0",
+  "description": "小红书链接注入器 v2.8.0：监听上限提升至10个会话（5个以上提醒卡顿）。主代理 456.chajianreader.cc.cd + 回退 Vercel 自定义域名 vercel.chajianreader.cc.cd + CF Worker 三级回退，国内可直连！支持 xhslink.cn/xhslink.com 新旧短链。",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",
