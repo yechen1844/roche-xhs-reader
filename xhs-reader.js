@@ -1,6 +1,12 @@
 /**
- * Roche 小红书链接注入器 v2.6.7
+ * Roche 小红书链接注入器 v2.8.0
  *
+ * v2.8.0 更新：监听会话上限提升至 10 个，5 个以上提醒可能卡顿
+ * v2.7.0 更新：内置代理全面升级，国内可直连访问！
+ *   - 主代理：Cloudflare Pages + 自定义域名（456.chajianreader.cc.cd）
+ *   - 回退 1：Vercel Global Proxy
+ *   - 回退 2：原始 CF Worker（workers.dev）
+ *   - 三级回退机制，确保任何网络环境都能用
  * v2.6.7 更新：支持小红书新版分享短链域名 xhslink.cn（如 http://xhslink.cn/o/xxx），
  *              旧版 xhslink.com 仍兼容；链接正则与校验同步覆盖两个域名。
  *
@@ -19,7 +25,7 @@
  *   4. 设置面板新增开关：一键开启/关闭内置代理
  *
  * v2.5.x 特性保留：isApkWebView() / smartFetch() CORS 拦截识别 / CF Worker 通用化
- * v2.4.x 特性保留：关闭面板不停监听 / autoListen 恢复 / 会话上限 3 个
+ * v2.4.x 特性保留：关闭面板不停监听 / autoListen 恢复 / 会话上限 10 个
  *
  * 触发方式：监听消息库，用户回车后 2s 内立即替换
  * 重要：关闭面板后监听继续在后台运行
@@ -28,7 +34,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.6.7",
+  version: "2.8.0",
   apps: [
     {
       id: "xhs-reader-home",
@@ -55,6 +61,11 @@ window.RochePlugin.register({
 // ============================================================
 // 常量
 // ============================================================
+// 主代理：Cloudflare Pages + 自定义域名（国内可访问）
+const BUILTIN_CF_PROXY = 'https://456.chajianreader.cc.cd';
+// 回退 1：Vercel + 自定义域名（国内可访问）
+const BUILTIN_VERCEL_PROXY = 'https://vercel.chajianreader.cc.cd';
+// 回退 2：原始 CF Worker（workers.dev，国内可能被墙）
 const BUILTIN_CF_WORKER = 'https://xhs-proxy.luyi90720.workers.dev';
 
 // ============================================================
@@ -66,7 +77,8 @@ let runtime = {
   rootEl: null,
   mode: 1,                     // 1 = 直注模式, 2 = 总结模式
   autoListen: false,
-  useBuiltinCf: true,          // 默认开启内置 CF Worker 代理
+  useBuiltinVercel: true,      // 默认开启内置 Vercel 代理（国内可访问）
+  useBuiltinCf: true,          // CF Worker 作为回退
   pollTimer: null,
   pollInterval: 2000,           // 2秒检测一次（之前 300ms 太频繁导致 Roche reactive 系统变卡）
   isPolling: false,            // 关键：全局锁，防止 pollOnce 并发执行
@@ -266,7 +278,10 @@ function getHtmlProxies(cfWorker, useBuiltin) {
     ];
     // 内置 CF 和自定义 CF 作为后备（放在公共代理之后）
     if (useBuiltin) {
-      list.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+      // 优先：自定义域名（国内可访问）→ Vercel → workers.dev
+      list.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+      list.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+      list.push({ name: 'CF-Worker', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     }
     if (cfWorker) {
       list.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
@@ -279,8 +294,10 @@ function getHtmlProxies(cfWorker, useBuiltin) {
   log(`环境检测: 浏览器 (本地文件: ${isLocal}, Origin: ${origin}, 内置代理: ${useBuiltin ? '开启' : '关闭'})`, 'info');
   const proxies = [];
   if (useBuiltin) {
-    // 内置 CF 开启 → 走内置 CF（自定义 CF 作为后备降级）
-    proxies.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    // 内置 CF 开启 → 优先自定义域名 → Vercel → workers.dev（自定义 CF 作为后备降级）
+    proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    proxies.push({ name: 'CF-Worker', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
   }
   if (cfWorker) {
     proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
@@ -301,7 +318,9 @@ function getImageProxies(cfWorker, useBuiltin) {
     // APK 端图片：只走 CF（内置 CF 优先 → 自定义 CF），没有则不注入图片
     // 不再走公共代理（公共代理返回的图片可能被防盗链拦截，且不符合用户要求）
     if (useBuiltin) {
-      proxies.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+      proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+      proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+      proxies.push({ name: 'CF-Worker', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     }
     if (cfWorker) {
       proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
@@ -310,7 +329,9 @@ function getImageProxies(cfWorker, useBuiltin) {
   } else {
     // 浏览器端图片：与文字一致，只走 CF
     if (useBuiltin) {
-      proxies.push({ name: '内置代理', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+      proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+      proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+      proxies.push({ name: 'CF-Worker', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     }
     if (cfWorker) {
       proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
@@ -1549,10 +1570,10 @@ function render(root) {
             </label>
             <span class="xhs-status" id="xhs-listen-status">${runtime.autoListen ? '运行中' : '已停止'}</span>
           </div>
-          <div class="xhs-hint" style="margin-top:6px;">勾选后会自动处理勾选会话中的小红书链接（300ms 检测间隔）</div>
+          <div class="xhs-hint" style="margin-top:6px;">勾选后会自动处理勾选会话中的小红书链接（2000ms 检测间隔）。最多可监听 10 个会话，⚠️ 监听 5 个以上对话可能造成卡顿，请酌情选择。</div>
         </div>
         <div class="xhs-field">
-          <label class="xhs-label">监听会话</label>
+          <label class="xhs-label">监听会话 <span style="color:#f39c12;font-size:11px;">(最多10个，5个以上可能卡顿)</span></label>
           <div class="xhs-conv-list" id="xhs-conv-list"></div>
         </div>
       </section>
@@ -1968,11 +1989,14 @@ function bindEvents(roche) {
     const idx = runtime.selectedIds.indexOf(id);
     if (idx >= 0) runtime.selectedIds.splice(idx, 1);
     else {
-      if (runtime.selectedIds.length >= 3) {
-        roche.ui.toast('最多监听 3 个会话');
+      if (runtime.selectedIds.length >= 10) {
+        roche.ui.toast('最多监听 10 个会话');
         return;
       }
       runtime.selectedIds.push(id);
+      if (runtime.selectedIds.length >= 5) {
+        roche.ui.toast(`已监听 ${runtime.selectedIds.length} 个会话。注意：监听 5 个以上对话可能会造成卡顿！`);
+      }
     }
     await rocheStorage.set(STORE_KEYS.selectedIds, runtime.selectedIds);
     renderConversationList();
