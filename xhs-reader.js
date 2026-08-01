@@ -34,7 +34,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.8.0",
+  version: "2.8.1",
   apps: [
     {
       id: "xhs-reader-home",
@@ -278,10 +278,9 @@ function getHtmlProxies(cfWorker, useBuiltin) {
     ];
     // 内置 CF 和自定义 CF 作为后备（放在公共代理之后）
     if (useBuiltin) {
-      // 优先：自定义域名（国内可访问）→ Vercel → workers.dev
+      // 优先：自定义域名（国内可访问）→ Vercel（同样返回解析 JSON）
       list.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
       list.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-      list.push({ name: 'CF-Worker', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     }
     if (cfWorker) {
       list.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
@@ -294,10 +293,9 @@ function getHtmlProxies(cfWorker, useBuiltin) {
   log(`环境检测: 浏览器 (本地文件: ${isLocal}, Origin: ${origin}, 内置代理: ${useBuiltin ? '开启' : '关闭'})`, 'info');
   const proxies = [];
   if (useBuiltin) {
-    // 内置 CF 开启 → 优先自定义域名 → Vercel → workers.dev（自定义 CF 作为后备降级）
+    // 内置 CF 开启 → 自定义域名优先 → Vercel（两者都返回解析后的 JSON，国内可直连）
     proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-    proxies.push({ name: 'CF-Worker', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
   }
   if (cfWorker) {
     proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
@@ -320,7 +318,6 @@ function getImageProxies(cfWorker, useBuiltin) {
     if (useBuiltin) {
       proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
       proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-      proxies.push({ name: 'CF-Worker', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     }
     if (cfWorker) {
       proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
@@ -331,7 +328,6 @@ function getImageProxies(cfWorker, useBuiltin) {
     if (useBuiltin) {
       proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
       proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-      proxies.push({ name: 'CF-Worker', fn: (u) => BUILTIN_CF_WORKER.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     }
     if (cfWorker) {
       proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
@@ -359,9 +355,6 @@ async function fetchXhsHtml(xhsUrl) {
   const isApk = isApkWebView();
   const isLocal = isBrowserLocalFile();
   log(`fetchXhsHtml: 环境=${isApk ? 'APK' : '浏览器'}${isLocal ? '(本地文件)' : ''}, 内置代理=${useBuiltin ? '开' : '关'}, 自定义CF=${cfWorker ? '有' : '无'}`, 'info');
-  if (useBuiltin) {
-    log(`fetchXhsHtml: 内置代理地址: ${BUILTIN_CF_WORKER}`, 'info');
-  }
   // 根据环境动态选择代理顺序
   const proxies = getHtmlProxies(cfWorker, useBuiltin);
   log(`fetchXhsHtml: 代理顺序 = ${proxies.map(p => p.name).join(' → ')}`, 'info');
@@ -389,27 +382,63 @@ async function fetchXhsHtml(xhsUrl) {
         lastErr = new Error(err);
         continue;
       }
-      let html;
-      if (isJsonMode) {
-        // allorigins /get 返回 JSON: { contents: "...", status: {...} }
-        const data = await resp.json();
-        if (data && typeof data.contents === 'string') {
-          html = data.contents;
-        } else {
-          lastErr = new Error('allorigins-json: contents 字段缺失');
-          errors.push(`${proxyName}: contents 缺失`);
+      const text = await resp.text();
+      const trimmed = (text || '').trim();
+
+      // ========== 情况 1：后端直接返回解析后的 JSON（456 / Vercel 主代理）==========
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        let parsed = null;
+        try { parsed = JSON.parse(trimmed); } catch (e) {}
+        // 判断是否为小红书笔记数据（有 noteId/title/desc/images 等业务字段）
+        const looksLikeNote = parsed && (
+          parsed.platform === 'xiaohongshu' ||
+          parsed.noteId || parsed.title || parsed.desc || parsed.images
+        );
+        if (parsed && looksLikeNote) {
+          // 后端错误响应：{error: '...'}
+          if (parsed.error && !parsed.noteId && !parsed.title && !parsed.desc) {
+            log(`fetchXhsHtml: [${proxyName}] 后端返回错误: ${parsed.error}`, 'error');
+            errors.push(`${proxyName}: ${parsed.error}`);
+            lastErr = new Error(parsed.error);
+            continue;
+          }
+          log(`fetchXhsHtml: [${proxyName}] JSON 解析结果（${text.length} 字节），采用`, 'success');
+          return { type: 'json', data: parsed };
+        }
+        // allorigins /get 模式：{ contents: "html" }
+        if (isJsonMode && parsed && typeof parsed.contents === 'string') {
+          const html = parsed.contents;
+          log(`fetchXhsHtml: [${proxyName}] allorigins contents ${html.length} 字节`, 'info');
+          if (html && html.includes('__INITIAL_STATE__')) {
+            if (html.includes('commentData')) {
+              log(`fetchXhsHtml: [${proxyName}] 移动版 HTML（含评论数据），采用`, 'success');
+              return { type: 'html', html };
+            }
+            log(`fetchXhsHtml: [${proxyName}] 桌面版 HTML（无 commentData），跳过`, 'warn');
+            lastErr = new Error('桌面版 HTML 无评论数据');
+            errors.push(`${proxyName}: 桌面版无评论`);
+            continue;
+          }
+          lastErr = new Error('页面未包含 __INITIAL_STATE__');
+          errors.push(`${proxyName}: 无 __INITIAL_STATE__`);
           continue;
         }
-      } else {
-        html = await resp.text();
+        // 其他 JSON（可能是代理错误信息等），继续下一个代理
+        log(`fetchXhsHtml: [${proxyName}] JSON 但非笔记数据，跳过`, 'warn');
+        lastErr = new Error('JSON 但非笔记数据');
+        errors.push(`${proxyName}: 非笔记JSON`);
+        continue;
       }
+
+      // ========== 情况 2：HTML（自定义 CF Worker 或公共代理）==========
+      const html = text;
       log(`fetchXhsHtml: [${proxyName}] OK, ${html.length} 字节`, 'success');
       if (html && html.includes('__INITIAL_STATE__')) {
         // 严格验证：必须是 iPhone UA 返回的移动版 HTML（含 commentData）
         // 桌面版 HTML（Chrome UA）虽然也有 __INITIAL_STATE__ 但评论为空，不能接受
         if (html.includes('commentData')) {
           log(`fetchXhsHtml: [${proxyName}] 移动版 HTML（含评论数据），采用`, 'success');
-          return html;
+          return { type: 'html', html };
         }
         log(`fetchXhsHtml: [${proxyName}] 桌面版 HTML（无 commentData），跳过`, 'warn');
         lastErr = new Error('桌面版 HTML 无评论数据');
@@ -542,8 +571,63 @@ async function downloadImageAsDataUrl(imageUrl) {
   throw new Error(`所有代理失败: ${errors.join(' | ')}`);
 }
 
+/**
+ * 将主代理返回的解析 JSON 转换为 note 结构（与 HTML 解析后的 note 字段对齐）
+ */
+function convertJsonToNote(d) {
+  return {
+    noteId: d.noteId || '',
+    title: d.title || '',
+    desc: d.desc || '',
+    type: d.type === 'video' ? 'video' : 'image',
+    user: d.author ? { nickname: d.author.nickname || '', userId: d.author.userId || '' } : null,
+    imageList: (d.images || []).map((img, idx) => ({
+      url: typeof img === 'string' ? img : (img.url || img.urlDefault || ''),
+      id: (d.noteId || 'note') + '_' + idx,
+    })).filter(img => img.url),
+    video: d.video ? { imageUrl: (d.images && d.images[0] && (typeof d.images[0] === 'string' ? d.images[0] : d.images[0].url)) || '' } : null,
+    tagList: (d.tags || []).map(t => typeof t === 'string' ? { name: t } : t),
+    interactInfo: {
+      likedCount: d.likedCount || 0,
+      collectedCount: d.collectedCount || 0,
+      commentCount: d.commentCount || 0,
+      shareCount: d.shareCount || 0,
+    },
+    time: d.time || d.createTime || '',
+  };
+}
+
+function convertJsonToComments(d) {
+  const comments = (d.comments || []).map(c => ({
+    content: c.content || '',
+    userInfo: { nickname: c.nickname || c.author || '' },
+    likeCount: c.likedCount || 0,
+    createTime: c.time || 0,
+  }));
+  return { comments };
+}
+
 async function processXhsLinkFull(xhsUrl) {
-  const html = await fetchXhsHtml(xhsUrl);
+  const fetched = await fetchXhsHtml(xhsUrl);
+
+  // 主代理 JSON 模式
+  if (fetched.type === 'json') {
+    const d = fetched.data;
+    const note = convertJsonToNote(d);
+    const comments = convertJsonToComments(d);
+    if (comments.comments.length) {
+      log(`抓取到 ${comments.comments.length} 条首屏评论`, 'success');
+    } else {
+      log('未抓取到首屏评论（可能为空）', 'warn');
+    }
+    const images = extractNoteImages(note);
+    const tags = extractTags(note);
+    const preview = extractPreview(note);
+    return { note, comments, images, tags, preview, source: 'json' };
+  }
+
+  // HTML 模式（自定义 CF Worker / allorigins）
+  const html = fetched.html;
   const state = parseXhsState(html);
   const note = extractNote(state);
   if (!note) throw new Error('未找到笔记数据');
@@ -556,7 +640,7 @@ async function processXhsLinkFull(xhsUrl) {
   const images = extractNoteImages(note);
   const tags = extractTags(note);
   const preview = extractPreview(note);
-  return { note, comments, images, tags, preview };
+  return { note, comments, images, tags, preview, source: 'html' };
 }
 
 // ============================================================
