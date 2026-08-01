@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.8.0",
-  "description": "小红书链接注入器 v2.8.0：监听上限提升至10个会话（5个以上提醒卡顿）。主代理 456.chajianreader.cc.cd + 回退 Vercel 自定义域名 vercel.chajianreader.cc.cd + CF Worker 三级回退，国内可直连！支持 xhslink.cn/xhslink.com 新旧短链。",
+  "version": "2.8.1",
+  "description": "小红书链接注入器 v2.8.1：主代理/回退均返回解析JSON（不再死等旧CF-Worker），图片走直通二进制代理。监听上限10个会话（5个以上提醒卡顿），国内可直连！",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",
