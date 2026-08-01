@@ -1,11 +1,14 @@
 /**
- * Roche 小红书链接注入器 v2.8.0
+ * Roche 小红书链接注入器 v2.8.2
  *
+ * v2.8.2 更新：代理链全面统一，APK/浏览器端均只走自建代理（456 → Vercel → 自定义CF），
+ *              移除全部公共代理；顶栏版本号与插件版本同步；自部署 Worker 脚本升级
+ *              （返回解析JSON + 图片直通）。
  * v2.8.0 更新：监听会话上限提升至 10 个，5 个以上提醒可能卡顿
  * v2.7.0 更新：内置代理全面升级，国内可直连访问！
  *   - 主代理：Cloudflare Pages + 自定义域名（456.chajianreader.cc.cd）
- *   - 回退 1：Vercel Global Proxy
- *   - 回退 2：原始 CF Worker（workers.dev）
+ *   - 回退 1：Vercel Global Proxy（vercel.chajianreader.cc.cd）
+ *   - 回退 2：自定义 CF Worker（可选）
  *   - 三级回退机制，确保任何网络环境都能用
  * v2.6.7 更新：支持小红书新版分享短链域名 xhslink.cn（如 http://xhslink.cn/o/xxx），
  *              旧版 xhslink.com 仍兼容；链接正则与校验同步覆盖两个域名。
@@ -15,14 +18,14 @@
  *                            注入：总结文本（详尽，500字左右）+ 评论 + 卡片占位符
  *
  * v2.6.0 关键改进（内置 CF Worker 代理，开箱即用）：
- *   1. 内置官方 CF Worker 代理（默认开启，浏览器端优先使用）
- *      - 地址：https://xhs-proxy.1844316589.workers.dev
+ *   1. 内置官方 CF Worker 代理（默认开启，APK/浏览器端均使用）
+ *      - 地址：https://456.chajianreader.cc.cd（主）/ https://vercel.chajianreader.cc.cd（回退）
  *      - 处理的数据仅限：小红书笔记链接、笔记HTML、小红书图片（全部公开数据）
  *      - 不经过用户隐私数据（聊天内容、角色人设、API Key 均不经过此代理）
- *      - 不放心可以自己部署 CF Worker，或关闭内置代理改用公共代理
- *   2. APK 端保持原逻辑：corsproxy 优先，CF Worker 仅用于图片下载
- *   3. 浏览器端：内置 CF Worker 优先（HTML+图片）→ 公共代理降级
- *   4. 设置面板新增开关：一键开启/关闭内置代理
+ *      - 不放心可以自己部署 CF Worker，或填入自定义代理后关闭内置代理
+ *   2. 代理链统一：内置主代理（456）→ Vercel → 自定义CF，文字与图片同一套代理
+ *   3. 图片直通：xhscdn 图片 URL 由代理直接返回二进制，无需二次转换
+ *   4. 设置面板开关：一键开启/关闭内置代理（默认开启）
  *
  * v2.5.x 特性保留：isApkWebView() / smartFetch() CORS 拦截识别 / CF Worker 通用化
  * v2.4.x 特性保留：关闭面板不停监听 / autoListen 恢复 / 会话上限 10 个
@@ -34,7 +37,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.8.1",
+  version: "2.8.2",
   apps: [
     {
       id: "xhs-reader-home",
@@ -65,8 +68,6 @@ window.RochePlugin.register({
 const BUILTIN_CF_PROXY = 'https://456.chajianreader.cc.cd';
 // 回退 1：Vercel + 自定义域名（国内可访问）
 const BUILTIN_VERCEL_PROXY = 'https://vercel.chajianreader.cc.cd';
-// 回退 2：原始 CF Worker（workers.dev，国内可能被墙）
-const BUILTIN_CF_WORKER = 'https://xhs-proxy.luyi90720.workers.dev';
 
 // ============================================================
 // 状态
@@ -113,24 +114,29 @@ let rocheStorage = null;
 
 // ============================================================
 // IndexedDB 操作（Roche 主消息库）
+// v2.8.2 实验性改动：DB 短连接模式（同 link-reader / RocheToolkit v3.2）
+//   openDB 不再缓存连接，每次读写操作在事务完成后立即 close()，
+//   避免长期缓存连接干扰 Roche 主程序快照隔离，导致注入后 UI 无法即时刷新
 // ============================================================
 const DB_NAME = 'Roche_db';
-let _db = null;
 
 function openDB() {
   return new Promise((resolve, reject) => {
-    if (_db) { resolve(_db); return; }
     const req = indexedDB.open(DB_NAME);
-    req.onsuccess = () => { _db = req.result; resolve(_db); };
+    req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
 
 function getAllRecords(storeName) {
   return openDB().then(db => new Promise((resolve, reject) => {
-    const req = db.transaction(storeName, 'readonly').objectStore(storeName).getAll();
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).getAll();
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => db.close();
+    tx.onabort = () => db.close();
   }));
 }
 
@@ -145,22 +151,33 @@ function getMessagesByConversation(conversationId) {
       resolve(req.result);
     };
     req.onerror = () => reject(req.error);
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => db.close();
+    tx.onabort = () => db.close();
   }));
 }
 
 function addMessage(msg) {
   return openDB().then(db => new Promise((resolve, reject) => {
-    const req = db.transaction('messages', 'readwrite').objectStore('messages').add(msg);
+    const tx = db.transaction('messages', 'readwrite');
+    const req = tx.objectStore('messages').add(msg);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => db.close();
+    tx.onabort = () => db.close();
   }));
 }
 
 function deleteMessage(id) {
   return openDB().then(db => new Promise((resolve, reject) => {
-    const req = db.transaction('messages', 'readwrite').objectStore('messages').delete(id);
+    const tx = db.transaction('messages', 'readwrite');
+    const req = tx.objectStore('messages').delete(id);
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => db.close();
+    tx.onabort = () => db.close();
   }));
 }
 
@@ -253,47 +270,23 @@ async function smartFetch(proxyUrl, options = {}, timeoutMs = 15000) {
 }
 
 /**
- * 返回 HTML 抓取的代理列表（按环境排序）
+ * 返回 HTML 抓取的代理列表（APK 与浏览器端统一，只走自建代理）
  *
- * APK 环境：保持原顺序（corsproxy 优先，已验证可用）
- *   - 内置 CF Worker 不使用（APK corsproxy 可用且更快）
- *   - 用户自定义 CF Worker 优先用于图片（保持原行为）
+ * 代理顺序（两端一致）：
+ *   1. 内置主代理（456.chajianreader.cc.cd，国内可直连，返回解析 JSON）
+ *   2. Vercel 代理（vercel.chajianreader.cc.cd，回退）
+ *   3. 自定义 CF Worker（可选，用户自行部署）
  *
- * 浏览器环境：
- *   - 内置 CF Worker 优先（如果开关开启）→ 处理 HTML+图片
- *   - 用户自定义 CF Worker 次之
- *   - allorigins JSON 模式再次之
- *   - corsproxy 仅在 localhost 可用（免费版 Origin 白名单限制）
+ * 文字与图片使用同一套代理；小红书图片 URL 由后端 isImageUrl 直通返回二进制。
  */
 function getHtmlProxies(cfWorker, useBuiltin) {
   const isApk = isApkWebView();
-  if (isApk) {
-    log(`环境检测: APK WebView (UA: ${(navigator.userAgent||'').substring(0,50)}...)`, 'info');
-    // APK 端：corsproxy 优先（用户要求保持原逻辑），但加入内置 CF 作为后备
-    const list = [
-      { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
-      { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
-      { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
-      { name: 'allorigins-raw', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` }
-    ];
-    // 内置 CF 和自定义 CF 作为后备（放在公共代理之后）
-    if (useBuiltin) {
-      // 优先：自定义域名（国内可访问）→ Vercel（同样返回解析 JSON）
-      list.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-      list.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-    }
-    if (cfWorker) {
-      list.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-    }
-    return list;
-  }
-  // 浏览器端（含本地 file://）：文字只走 CF，公共代理会返回桌面版 HTML（无评论）
   const isLocal = isBrowserLocalFile();
   const origin = (typeof location !== 'undefined' ? location.origin : 'unknown');
-  log(`环境检测: 浏览器 (本地文件: ${isLocal}, Origin: ${origin}, 内置代理: ${useBuiltin ? '开启' : '关闭'})`, 'info');
+  log(`环境检测: ${isApk ? 'APK WebView' : '浏览器'}${isLocal ? '(本地文件)' : ''} (Origin: ${origin}, 内置代理: ${useBuiltin ? '开启' : '关闭'}, 自定义CF: ${cfWorker ? '有' : '无'})`, 'info');
   const proxies = [];
   if (useBuiltin) {
-    // 内置 CF 开启 → 自定义域名优先 → Vercel（两者都返回解析后的 JSON，国内可直连）
+    // 内置主代理优先 → Vercel 回退（两者都返回解析后的 JSON，国内可直连）
     proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
     proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
   }
@@ -301,52 +294,31 @@ function getHtmlProxies(cfWorker, useBuiltin) {
     proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
   }
   if (proxies.length === 0) {
-    log(`⚠️ 浏览器端未启用任何 CF Worker，无法抓取（公共代理返回桌面版 HTML 无评论数据）`, 'warn');
+    log(`⚠️ 未启用任何代理，无法抓取（请开启内置代理或填写自定义 CF Worker）`, 'warn');
   }
   return proxies;
 }
 
 /**
- * 返回图片下载的代理列表（按环境排序）
+ * 返回图片下载的代理列表（APK 与浏览器端统一，与文字同一套代理）
+ * 图片 URL 由后端 isImageUrl 直通返回二进制，无需二次转换
  */
 function getImageProxies(cfWorker, useBuiltin) {
   const proxies = [];
-  const isApk = isApkWebView();
-  if (isApk) {
-    // APK 端图片：只走 CF（内置 CF 优先 → 自定义 CF），没有则不注入图片
-    // 不再走公共代理（公共代理返回的图片可能被防盗链拦截，且不符合用户要求）
-    if (useBuiltin) {
-      proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-      proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-    }
-    if (cfWorker) {
-      proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-    }
-    // proxies 为空时 → downloadImageAsDataUrl 会抛错，processMode1 的 try/catch 会跳过该图片
-  } else {
-    // 浏览器端图片：与文字一致，只走 CF
-    if (useBuiltin) {
-      proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-      proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-    }
-    if (cfWorker) {
-      proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
-    }
+  if (useBuiltin) {
+    proxies.push({ name: '内置主代理', fn: (u) => BUILTIN_CF_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+    proxies.push({ name: 'Vercel代理', fn: (u) => BUILTIN_VERCEL_PROXY.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
   }
+  if (cfWorker) {
+    proxies.push({ name: 'CF-Worker(自定义)', fn: (u) => cfWorker.replace(/\/$/, '') + '?url=' + encodeURIComponent(u) });
+  }
+  // proxies 为空时 → downloadImageAsDataUrl 会抛错，processMode1 的 try/catch 会跳过该图片
   return proxies;
 }
 
 // ============================================================
 // 小红书抓取
 // ============================================================
-const CORS_PROXIES = [
-  // 兼容旧引用（实际逻辑由 getHtmlProxies/getImageProxies 动态生成）
-  (url) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`,
-  (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
-  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`
-];
-
 async function fetchXhsHtml(xhsUrl) {
   // 读取 CF Worker 地址（通用版可同时处理 HTML 和图片）
   const cfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
@@ -405,10 +377,10 @@ async function fetchXhsHtml(xhsUrl) {
           log(`fetchXhsHtml: [${proxyName}] JSON 解析结果（${text.length} 字节），采用`, 'success');
           return { type: 'json', data: parsed };
         }
-        // allorigins /get 模式：{ contents: "html" }
+        // JSON 包装模式（兼容自定义代理返回 { contents: "html" } 格式）
         if (isJsonMode && parsed && typeof parsed.contents === 'string') {
           const html = parsed.contents;
-          log(`fetchXhsHtml: [${proxyName}] allorigins contents ${html.length} 字节`, 'info');
+          log(`fetchXhsHtml: [${proxyName}] JSON 包装的 HTML ${html.length} 字节`, 'info');
           if (html && html.includes('__INITIAL_STATE__')) {
             if (html.includes('commentData')) {
               log(`fetchXhsHtml: [${proxyName}] 移动版 HTML（含评论数据），采用`, 'success');
@@ -430,7 +402,7 @@ async function fetchXhsHtml(xhsUrl) {
         continue;
       }
 
-      // ========== 情况 2：HTML（自定义 CF Worker 或公共代理）==========
+      // ========== 情况 2：HTML（自定义 CF Worker）==========
       const html = text;
       log(`fetchXhsHtml: [${proxyName}] OK, ${html.length} 字节`, 'success');
       if (html && html.includes('__INITIAL_STATE__')) {
@@ -626,7 +598,7 @@ async function processXhsLinkFull(xhsUrl) {
     return { note, comments, images, tags, preview, source: 'json' };
   }
 
-  // HTML 模式（自定义 CF Worker / allorigins）
+  // HTML 模式（自定义 CF Worker 返回的原始 HTML）
   const html = fetched.html;
   const state = parseXhsState(html);
   const note = extractNote(state);
@@ -1140,9 +1112,13 @@ function extractXhsUrl(text) {
 
 function getMessageById(id) {
   return openDB().then(db => new Promise((resolve, reject) => {
-    const req = db.transaction('messages', 'readonly').objectStore('messages').get(id);
+    const tx = db.transaction('messages', 'readonly');
+    const req = tx.objectStore('messages').get(id);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => db.close();
+    tx.onabort = () => db.close();
   }));
 }
 
@@ -1544,7 +1520,7 @@ async function initApp(root, roche) {
   const ball = document.getElementById('xhs-floating-ball');
   if (ball) ball.style.display = 'none';
   updateBallStatus(runtime.autoListen ? 'listening' : 'idle', runtime.autoListen ? '小红书注入器 (监听中)' : '小红书注入器 (未监听)');
-  log('插件已加载 v2.6.5', 'success');
+  log('插件已加载 v2.8.2', 'success');
 }
 
 function cleanup() {
@@ -1605,7 +1581,7 @@ function render(root) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="flex:1;min-width:0;">
           <h2 class="xhs-title">小红书链接注入器</h2>
-          <p class="xhs-subtitle">v2.6.5 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
+          <p class="xhs-subtitle">v2.8.2 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
         </div>
         <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
       </div>
@@ -1815,12 +1791,11 @@ $1
           <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;">
             <input type="checkbox" id="xhs-builtin-cf-toggle" ${runtime.useBuiltinCf ? 'checked' : ''} style="margin-top:2px;flex:0 0 auto;" />
             <div style="font-size:13px;line-height:1.6;">
-              <strong>使用内置 CF Worker 代理</strong>（默认开启）<br/>
+              <strong>使用内置代理</strong>（默认开启，APK/浏览器均生效）<br/>
               <span style="color:var(--xhs-text-dim);">
-                浏览器端自动使用官方代理解决 corsproxy 403 问题，无需自行部署。<br/>
+                主代理 456.chajianreader.cc.cd（国内可直连）→ Vercel 回退，文字与图片统一走此代理，无需挂梯子。<br/>
                 该代理仅处理小红书公开数据（笔记链接、HTML页面、图片），<strong>不经过任何用户隐私数据</strong>（聊天内容、角色人设、API Key 等均不经此代理）。<br/>
-                若不放心可关闭，或填入自己的 CF Worker 地址。<br/>
-                <strong>APK 端不受此开关影响</strong>，APK 默认走公共代理（corsproxy 可用）。
+                如已填写自定义 CF Worker，可关闭内置代理仅使用自己的代理；关闭且未填写自定义代理时将无法抓取。
               </span>
             </div>
           </label>
@@ -1828,7 +1803,7 @@ $1
         <div class="xhs-field">
           <label class="xhs-label">自定义 Cloudflare Worker 代理地址（可选）</label>
           <input type="text" class="xhs-input" id="xhs-cf-worker" placeholder="https://xxx.your-name.workers.dev" />
-          <div class="xhs-hint" style="margin-top:6px;">下载图片和抓取HTML时优先使用。开启内置代理后，自定义代理作为备选。留空则仅使用内置代理+公共代理。</div>
+          <div class="xhs-hint" style="margin-top:6px;">下载图片和抓取HTML时作为第三层回退。开启内置代理后，自定义代理作为备选；留空则仅使用内置代理。</div>
         </div>
         <div class="xhs-field">
           <label class="xhs-label">Worker 部署教程（如果想自己部署）</label>
@@ -1841,39 +1816,55 @@ $1
         </div>
         <div class="xhs-field">
           <label class="xhs-label">Worker 脚本（复制这段）</label>
-          <textarea class="xhs-input" readonly rows="10" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">export default {
+          <textarea class="xhs-input" readonly rows="16" style="font-family:monospace;font-size:11px;resize:vertical;" onclick="this.select()">export default {
   async fetch(request) {
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: {
-        'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,OPTIONS',
-        'Access-Control-Allow-Headers': '*', 'Access-Control-Max-Age': '86400'
-      }});
-    }
+    const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+    const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,OPTIONS', 'Access-Control-Allow-Headers': '*', 'Access-Control-Max-Age': '86400' };
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
     const url = new URL(request.url);
     const target = url.searchParams.get('url');
-    if (!target) return new Response('xhs-proxy ready. Usage: ?url=<xhs_url>', {
-      status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain; charset=utf-8' }
-    });
+    if (!target) return new Response('xhs-proxy ready. Usage: ?url=<xhs_url>', { status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain; charset=utf-8' } });
+
+    // 图片直通：小红书图片 URL（xhscdn）直接返回二进制
+    if (/\.(jpe?g|png|webp|gif|avif)(\?|$)/i.test(target) || /xhscdn\.com|sns-img|sns-webpic/i.test(target)) {
+      try {
+        const resp = await fetch(target, { headers: { 'User-Agent': UA, 'Referer': 'https://www.xiaohongshu.com/', 'Accept': 'image/*,*/*' }, redirect: 'follow' });
+        const h = new Headers(resp.headers);
+        h.set('Access-Control-Allow-Origin', '*');
+        h.set('Cache-Control', 'public, max-age=86400');
+        return new Response(resp.body, { status: resp.status, headers: h });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'image_proxy_failed', message: e.message }), { status: 502, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // 笔记解析：iPhone UA 抓取移动版 HTML，提取 __INITIAL_STATE__ 返回解析 JSON
     try {
-      const resp = await fetch(target, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Referer': 'https://www.xiaohongshu.com/',
-          'Accept': '*/*'
-        }
-      });
-      const body = await resp.arrayBuffer();
-      const headers = new Headers(resp.headers);
-      headers.set('Access-Control-Allow-Origin', '*');
-      headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
-      headers.set('Access-Control-Allow-Headers', '*');
-      headers.delete('content-security-policy');
-      headers.delete('x-frame-options');
-      return new Response(body, { status: resp.status, headers });
+      const resp = await fetch(target, { headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'zh-CN,zh;q=0.9' }, redirect: 'follow' });
+      const html = await resp.text();
+      const m = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\})<\/script>/);
+      if (!m) return new Response(JSON.stringify({ error: '无法解析小红书页面' }), { status: 502, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } });
+      let state;
+      try { state = JSON.parse(m[1]); } catch (e) { try { state = JSON.parse(m[1].replace(/undefined/g, 'null')); } catch (e2) { return new Response(JSON.stringify({ error: 'JSON解析失败' }), { status: 502, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } }); } }
+      const map = state.note && state.note.noteDetailMap || {};
+      const note = state.noteData && state.noteData.data && state.noteData.data.noteData || (Object.keys(map)[0] ? map[Object.keys(map)[0]].note : null);
+      const comments = state.noteData && state.noteData.data && state.noteData.data.commentData ? state.noteData.data.commentData.comments || [] : [];
+      if (!note) return new Response(JSON.stringify({ error: '未找到笔记数据' }), { status: 404, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } });
+      const result = {
+        platform: 'xiaohongshu',
+        noteId: note.noteId,
+        title: note.title || '',
+        desc: note.desc || '',
+        type: note.type === 'video' ? 'video' : 'image',
+        author: { nickname: note.user && note.user.nickname || '', userId: note.user && note.user.userId || '', avatar: note.user && note.user.avatar || '' },
+        images: (note.imageList || []).map(function (img) { return { url: img.urlDefault || img.url || (img.infoList && img.infoList[0] && img.infoList[0].url), width: img.width, height: img.height }; }),
+        video: (note.video && note.video.media && note.video.media.stream && ((note.video.media.stream.h264 && note.video.media.stream.h264[0] && note.video.media.stream.h264[0].masterUrl) || (note.video.media.stream.h265 && note.video.media.stream.h265[0] && note.video.media.stream.h265[0].masterUrl))) || null,
+        tags: (note.tagList || []).map(function (t) { return t.name || t; }),
+        comments: comments.slice(0, 20).map(function (c) { return { content: c.content, nickname: c.userInfo && c.userInfo.nickname || (c.user && c.user.nickname), likedCount: c.likeCount || 0, time: c.createTime }; })
+      };
+      return new Response(JSON.stringify(result, null, 2), { status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json; charset=utf-8' } });
     } catch (e) {
-      return new Response('fetch error: ' + e.message, {
-        status: 502, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain' }
-      });
+      return new Response(JSON.stringify({ error: 'request_failed', message: e.message }), { status: 502, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } });
     }
   }
 }</textarea>
@@ -2023,7 +2014,7 @@ function bindEvents(roche) {
         b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
       });
       const sub = root.querySelector('.xhs-subtitle');
-      if (sub) sub.textContent = `v2.6.5 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
+      if (sub) sub.textContent = `v2.8.2 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
       roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
       log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
     });
